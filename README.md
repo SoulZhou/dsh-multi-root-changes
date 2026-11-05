@@ -1,7 +1,7 @@
 # dsh-multi-root-changes
 
 给 DeepSeek Harness 的侧栏加一个 **多根改动** 页签：一个面板里同时看到会话主工作目录
-**以及所有已登记的附加工作目录**的 Git 改动。
+**以及所有已登记的附加工作目录**的 Git 改动与提交历史。
 
 ![多根改动面板](screenshots/panel.png)
 
@@ -34,6 +34,12 @@ Agent 能读写它们，**但你仍然只能在面板里看到主仓库的改动
 ## 功能
 
 - **按根分组**：主目录 + 每个附加目录各一节，显示目录名、分支、ahead/behind、增删行数、文件数。
+- **每个目录的提交历史**：每节下方可展开该仓库自己的最近 30 条提交
+  （短 hash、作者、相对时间、`HEAD -> master` 之类的 ref 徽章），
+  点任意一条看该提交的 patch。三个平级仓库各看各的历史，互不混用。
+
+  ![每个目录的提交历史](screenshots/commits.png)
+
 - **目录树折叠**：改动路径按 VS Code SCM 的方式折成目录树，单链目录压缩成一行（`a/b/c`）。
 - **行级 diff**：点任意文件读该文件的 unified diff（含 hunk 头与 +/- 行号）。
 - **重命名**：porcelain v2 的 `2` 记录带 `origPath`，显示为 `旧 → 新`，两侧路径都进 pathspec。
@@ -66,21 +72,24 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
 
 - 顶部是文件总数与刷新按钮。
 - 每个目录一节，点标题折叠/展开。
+- 每节底部的「提交历史」可展开该仓库自己的最近 30 条提交，点一条看它的 patch。
 - 点文件在底部打开 diff，`×` 关闭，`↻` 重读。
 - 不可见时自动停止轮询，8 秒一次（可见时）。
 
 ## 访问级别与安全
 
-- **全程只读**：只执行 `status` / `rev-parse` / `diff`。不 stage、不 commit、不 checkout、不写任何文件。
+- **全程只读**：只执行 `status` / `rev-parse` / `log` / `show` / `diff`。不 stage、不 commit、不 checkout、不写任何文件。
 - 面板只展示"改了什么"，改动由你自己在 Git 或 Agent 侧处理。
-- 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state` 与 `/dsh-multi-root-changes/api/diff`。
+- 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state`、`/diff`、`/log`、`/commit`。
+- 提交 hash 在进入命令行前只放行十六进制对象 id，因此不会被当作 flag 或 rev 表达式。
 
 ## 已知边界
 
 - 只读：没有暂存、提交、丢弃、切换分支等写操作。
-- 不做提交图、不做 stash/branch 操作 —— 那些用 better-sidebar 自带的 Git 页签。
+- 没有完整的提交图（泳道连线），只有线性列表与单提交 patch；分支树/合并/变基等操作用 better-sidebar 自带的 Git 页签。
+- 合并提交不显示 patch（git 本身也要 `-m` 才有单一差异），只显示它的元数据与父提交数。
 - 附加根里若登记的是**另一个仓库的子目录**，会被判为「属于另一个仓库」而不是独立仓库（有意的，避免把父仓库的改动记到子目录上）。
-- 单文件 diff 上限 2 MiB、未跟踪文件预览上限 1 MiB、单根条目上限 3000；超出会明确提示截断。
+- 单文件 diff 上限 2 MiB、未跟踪文件预览上限 1 MiB、单根条目上限 3000、每根提交上限 30 条；超出会明确提示截断。
 - Windows 下经受限 token 启动的进程可能读不到某些路径，此时该目录会显示读取失败原因而不是静默消失。
 
 ## 开发与验证
@@ -88,14 +97,17 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
 ```sh
 node --check index.js
 node --check client.js
-node tests/verify-parsers.mjs      # 解析器对真实三仓 + 合成记录的验证
+node tests/verify-parsers.mjs       # 工作区改动解析器：真实三仓 + 合成记录
+node tests/verify-commit-log.mjs    # 提交历史解析器：真实三仓 + 合成记录
 ```
 
-`tests/verify-parsers.mjs` 会直接对真实仓库跑 `git status --porcelain=v2 --branch -z`，
-用一个**独立的 oracle 计数**交叉校验解析条目数，并覆盖重命名、冲突、CJK、空格路径等分支。
+两个脚本都直接对真实仓库跑 git，并用**独立的 oracle** 交叉校验：
+`verify-parsers.mjs` 比对条目数（并覆盖重命名、冲突、CJK、空格路径），
+`verify-commit-log.mjs` 比对提交条数与 **git 自己的提交顺序**。
 
 GUI 验证脚本（`tests/cdp-*.mjs`）通过 CDP 驱动真实浏览器，断言三个目录都列出、
-各自文件数正确、附加根的文件 diff 能渲染、控制台零报错。
+各自文件数正确、每个目录显示**互不相同**的提交历史、附加根的文件与提交 patch 都能渲染、
+控制台零报错。
 
 ## 许可证
 

@@ -538,6 +538,156 @@ function looksBinary(buffer) {
 }
 
 /**
+ * Parse `git log` output written with a RECORD SEPARATOR framing.
+ *
+ * A commit subject can contain almost anything — including `|`, tabs and
+ * newlines after the subject line — so the fields are read by POSITION between
+ * two sentinels rather than by splitting on a character that might also occur
+ * inside a value. `%x1e` / `%x1f` are chosen because a commit message cannot
+ * contain them: git refuses control characters in object content.
+ */
+function parseLog(raw) {
+  const commits = [];
+  for (const record of raw.split('\x1e')) {
+    const text = record.trim();
+    if (text === '') continue;
+    const [hash, shortHash, author, authorMail, timestamp, refs, subject] = text.split('\x1f');
+    if (hash === undefined || hash === '') continue;
+    commits.push({
+      hash,
+      shortHash: shortHash ?? hash.slice(0, 7),
+      author: author ?? '',
+      authorMail: authorMail ?? '',
+      // A unix timestamp in SECONDS; the client formats it in the local zone.
+      timestamp: Number(timestamp) || 0,
+      refs: (refs ?? '').split(',').map((ref) => ref.trim()).filter((ref) => ref !== ''),
+      subject: subject ?? ''
+    });
+  }
+  return commits;
+}
+
+/**
+ * One root's recent commit history.
+ *
+ * `HEAD` may not exist yet (a repository with no commits). That is an ordinary
+ * state, not a failure — the answer is an empty list with `hasCommits: false`,
+ * so the panel can say so instead of showing an error.
+ */
+async function readRootLog(root, limit) {
+  const count = Math.min(Math.max(1, limit), 200);
+  try {
+    const raw = await runGit(root, [
+      'log',
+      `-n${count}`,
+      '--no-color',
+      // Sentinels: RS before each commit, US between fields.
+      '--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s'
+    ], { maxBytes: 1024 * 1024 });
+    return { hasCommits: true, commits: parseLog(raw) };
+  } catch (error) {
+    const message = error.message || '';
+    // `git log` on an unborn branch exits non-zero with this phrasing.
+    if (/does not have any commits yet|unknown revision|bad revision|ambiguous argument 'HEAD'|your current branch .* does not have any commits/i.test(message)) {
+      return { hasCommits: false, commits: [] };
+    }
+    throw error;
+  }
+}
+
+/**
+ * One commit's own patch, read from the root that owns it.
+ *
+ * A merge commit has no single diff worth showing (git prints nothing for it
+ * without `-m`), so the answer says `merge: true` and the client renders the
+ * commit's metadata alone rather than an empty patch that looks like a failure.
+ */
+async function handleCommit(request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  const hash = typeof body.hash === 'string' && body.hash !== '' ? body.hash : '';
+  if (root === '' || hash === '') {
+    sendText(response, 400, 'root and hash are required');
+    return;
+  }
+  // A revision is user input: only plain hex object ids reach the command line,
+  // so nothing here can be read as a flag or a rev expression.
+  if (!/^[0-9a-f]{4,64}$/i.test(hash)) {
+    sendText(response, 400, 'hash must be a hex object id');
+    return;
+  }
+
+  try {
+    const raw = await runGit(root, [
+      'show',
+      '--no-color',
+      '--date=unix',
+      '--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%cI%x1f%D%x1f%s%x1f%b',
+      '-U3',
+      hash
+    ], { maxBytes: MAX_DIFF_BYTES });
+
+    const separator = raw.indexOf('\x1f');
+    if (separator === -1) {
+      sendJson(response, 200, { kind: 'empty', hash });
+      return;
+    }
+    // Split the header from the patch at the first `diff --git` (or the end).
+    const bodyStart = raw.search(/\ndiff --git |\n--\n/);
+    const headerText = bodyStart === -1 ? raw : raw.slice(0, bodyStart + 1);
+    const patch = bodyStart === -1 ? '' : raw.slice(bodyStart + 1);
+
+    const fields = headerText.replace(/^\x1e/, '').split('\x1f');
+    const meta = {
+      hash: fields[0] ?? hash,
+      shortHash: fields[1] ?? hash.slice(0, 7),
+      author: fields[2] ?? '',
+      authorMail: fields[3] ?? '',
+      timestamp: Number(fields[4]) || 0,
+      committedIso: fields[5] ?? '',
+      refs: (fields[6] ?? '').split(',').map((ref) => ref.trim()).filter((ref) => ref !== ''),
+      subject: fields[7] ?? '',
+      body: (fields[8] ?? '').trim()
+    };
+
+    const parents = (await runGit(root, ['rev-list', '--parents', '-n', '1', hash], { maxBytes: 16 * 1024 }))
+      .trim().split(/\s+/).filter((part) => part !== '');
+    const isMerge = parents.length > 2;
+
+    sendJson(response, 200, {
+      kind: 'commit',
+      meta,
+      merge: isMerge,
+      parentCount: Math.max(0, parents.length - 1),
+      patch: isMerge ? '' : patch,
+      truncated: Buffer.byteLength(patch, 'utf8') >= MAX_DIFF_BYTES
+    });
+  } catch (error) {
+    sendText(response, error.status ?? 500, error.message || 'commit failed');
+  }
+}
+
+/** Recent history for every root, asked for in one request. */
+async function handleLog(request, response) {
+  const body = await readJsonBody(request);
+  const roots = Array.isArray(body.roots) ? body.roots.filter((root) => typeof root === 'string' && root !== '') : [];
+  if (roots.length === 0) {
+    sendJson(response, 200, { roots: [] });
+    return;
+  }
+  const limit = Number.isInteger(body.limit) ? body.limit : 30;
+  const readings = await Promise.all(roots.slice(0, MAX_ADDITIONAL_ROOTS + 1).map(async (root) => {
+    try {
+      const log = await readRootLog(root, limit);
+      return { path: root, isRepo: true, ...log };
+    } catch (error) {
+      return { path: root, isRepo: false, hasCommits: false, commits: [], error: error.message };
+    }
+  }));
+  sendJson(response, 200, { roots: readings });
+}
+
+/**
  * One file's diff, read from the root the file actually belongs to.
  *
  * `staged` selects index-vs-HEAD; the default is worktree-vs-index. An untracked
@@ -611,6 +761,20 @@ export function apply(ctx) {
             if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
             return handleDiff(request, response);
           }
+        },
+        {
+          path: `${API}/log`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleLog(request, response);
+          }
+        },
+        {
+          path: `${API}/commit`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleCommit(request, response);
+          }
         }
       ];
 
@@ -633,4 +797,4 @@ export function apply(ctx) {
   });
 }
 
-export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity };
+export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog };
