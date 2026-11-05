@@ -860,7 +860,13 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-primary); }
 .mrc-commitButton { border: 0; border-radius: 4px; cursor: pointer; font: inherit; font-size: 11px;
   padding: 3px 10px; font-weight: 600;
-  background: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-bg-base, #fff); }
+  /* The label must not read its colour from a SURFACE alias: theme plugins
+     rewrite --dsw-alias-bg-base to transparent (glass mode), which turned this
+     text invisible on the brand-coloured button. A fixed dark ink on the brand
+     fill is legible in both themes and independent of what the shell does to
+     its surface tokens. */
+  background: var(--dsw-alias-state-business-primary);
+  color: #0b0f14; }
 .mrc-commitButton:hover:not(:disabled) { filter: brightness(1.08); }
 .mrc-aiButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
