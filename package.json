@@ -1,6 +1,6 @@
 {
   "name": "dsh-multi-root-changes",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Multi-root changes panel for DeepSeek Harness: one Git changes view that covers the session's primary workspace root AND every writable additional root registered through multi-root-workspace.",
   "type": "module",
   "license": "MIT",

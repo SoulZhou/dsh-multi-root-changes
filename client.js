@@ -799,6 +799,20 @@ window.__ModuleLoader__.load({
    this rule prevents. Painting layer-1 (an opaque alias) keeps the panel a
    panel whatever the shell does, and isolation starts a new stacking context
    so nothing inside can blend with the page behind it either. */
+/* The host's tab-strip row ABOVE the panel is a sibling of the pane body, so no
+   rule inside .mrc-panel can reach it. That row has NO background of its own:
+   it inherits the right sidebar's surface, which wallpaper/glass themes rewrite
+   to transparent on #root. The result is a 38px band where the conversation
+   behind the sidebar bleeds through the tab titles — the panel body below is
+   already opaque, but the strip is not.
+
+   :has() scopes this to the ONE dockkit pane that actually hosts our panel, so
+   other tabs keep whatever surface the theme gives them. layer-1 is an opaque
+   alias even in glass mode (that theme only clears bg-base and sidebar-fill). */
+[data-dockkit-pane]:has(.mrc-panel) [class*="tabHostHeader"],
+[data-dockkit-pane]:has(.mrc-panel) [class*="tabStrip"] {
+  background-color: var(--dsw-alias-bg-layer-1, #161b19) !important;
+}
 .mrc-panel { display: flex; flex-direction: column; height: 100%; min-height: 0;
   color: var(--dsw-alias-label-primary); font-size: 12px;
   background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base, #161b19));
