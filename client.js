@@ -65,7 +65,13 @@ window.__ModuleLoader__.load({
         tooLarge: '文件过大，仅显示前一部分',
         commits: '提交历史',
         noCommits: '这个仓库还没有提交',
-        mergeCommit: '合并提交（{count} 个父提交），无单一差异'
+        mergeCommit: '合并提交（{count} 个父提交），无单一差异',
+        commitPlaceholder: '提交信息（Ctrl+Enter 提交）',
+        commitAction: '提交',
+        committing: '提交中…',
+        aiGenerate: 'AI 生成',
+        generating: '生成中…',
+        committed: '已提交 {hash}'
       },
       en: {
         tab: 'Multi-root changes',
@@ -93,7 +99,13 @@ window.__ModuleLoader__.load({
         tooLarge: 'File too large; showing the beginning only',
         commits: 'Commit history',
         noCommits: 'This repository has no commits yet',
-        mergeCommit: 'Merge commit ({count} parents) — no single diff to show'
+        mergeCommit: 'Merge commit ({count} parents) — no single diff to show',
+        commitPlaceholder: 'Commit message (Ctrl+Enter to commit)',
+        commitAction: 'Commit',
+        committing: 'Committing…',
+        aiGenerate: 'AI draft',
+        generating: 'Drafting…',
+        committed: 'Committed {hash}'
       }
     };
 
@@ -468,9 +480,96 @@ window.__ModuleLoader__.load({
           : null);
     }
 
+    /** One root's collapsible commit box: message, AI draft, and the commit. */
+    function CommitBox(props) {
+      const { root, t, onCommitted, sessionId } = props;
+      const [message, setMessage] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [suggesting, setSuggesting] = useState(false);
+      const [error, setError] = useState(null);
+      const [notice, setNotice] = useState(null);
+
+      const entries = root.status?.entries ?? [];
+      // The box commits the WORKING TREE set: every changed path the panel is
+      // showing. Explicitly named, never `git add -A`.
+      const paths = entries.map((entry) => entry.path);
+
+      const suggest = async () => {
+        if (suggesting || busy || paths.length === 0) return;
+        setSuggesting(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const reply = await postJson('/suggest-message', {
+            root: root.path,
+            sessionId,
+            language: isZh() ? 'zh' : 'en',
+            focus: 'worktree'
+          });
+          setMessage(reply.message ?? '');
+        } catch (failure) {
+          setError(String(failure.message || failure));
+        } finally {
+          setSuggesting(false);
+        }
+      };
+
+      const commit = async () => {
+        if (busy || suggesting) return;
+        if (message.trim() === '' || paths.length === 0) return;
+        setBusy(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const reply = await postJson('/commit-write', { root: root.path, message, paths });
+          setNotice(t('committed', { hash: reply.hash ?? '' }));
+          setMessage('');
+          onCommitted?.();
+        } catch (failure) {
+          setError(String(failure.message || failure));
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      return h('div', { className: 'mrc-commitBox' },
+        h('textarea', {
+          className: 'mrc-commitInput',
+          value: message,
+          rows: 2,
+          placeholder: t('commitPlaceholder'),
+          spellCheck: false,
+          disabled: busy || suggesting,
+          onChange: (event) => setMessage(event.currentTarget.value),
+          onKeyDown: (event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+              event.preventDefault();
+              void commit();
+            }
+          }
+        }),
+        h('div', { className: 'mrc-commitActions' },
+          h('button', {
+            type: 'button',
+            className: 'mrc-aiButton',
+            disabled: busy || suggesting || paths.length === 0,
+            title: t('aiGenerate'),
+            onClick: () => { void suggest() }
+          }, suggesting ? t('generating') : `✦ ${t('aiGenerate')}`),
+          h('span', { className: 'mrc-commitCount' }, t('files', { count: paths.length })),
+          h('button', {
+            type: 'button',
+            className: 'mrc-commitButton',
+            disabled: busy || suggesting || message.trim() === '' || paths.length === 0,
+            onClick: () => { void commit() }
+          }, busy ? t('committing') : t('commitAction'))),
+        error !== null ? h('div', { className: 'mrc-note mrc-error' }, error) : null,
+        notice !== null ? h('div', { className: 'mrc-note mrc-ok' }, notice) : null);
+    }
+
     /** One root's collapsible section: header, counters, tree. */
     function RootSection(props) {
-      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit } = props;
+      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId } = props;
       const status = root.status ?? {};
       const entries = Array.isArray(status.entries) ? status.entries : [];
       const [open, setOpen] = useState(true);
@@ -533,6 +632,9 @@ window.__ModuleLoader__.load({
           hasRepo && entries.length === 0 ? h('div', { className: 'mrc-note' }, t('emptyRoot')) : null,
           hasRepo && status.truncated === true ? h('div', { className: 'mrc-note' }, t('truncated')) : null,
           hasRepo && tree.length > 0 ? h('div', { className: 'mrc-tree' }, tree.map((node, index) => renderNode(node, 0, `${root.path}:${index}`))) : null,
+          hasRepo && entries.length > 0
+            ? h(CommitBox, { root, t, sessionId, onCommitted })
+            : null,
           hasRepo
             ? h(CommitSection, {
               root,
@@ -593,7 +695,12 @@ window.__ModuleLoader__.load({
       const roots = state.data?.roots ?? [];
       const totalFiles = roots.reduce((sum, root) => sum + (root.status?.entries?.length ?? 0), 0);
 
-      return h('div', { className: 'mrc-panel' },
+      return h('div', {
+        className: 'mrc-panel',
+        // Drives the left/right split: the stylesheet switches on this one
+        // attribute instead of two different component trees.
+        'data-preview': selected !== null || selectedCommit !== null ? 'true' : undefined
+      },
         h('div', { className: 'mrc-bar' },
           h('span', { className: 'mrc-title' }, t('tab')),
           h('span', { className: 'mrc-total' }, state.loading ? t('loading') : t('files', { count: totalFiles })),
@@ -616,62 +723,80 @@ window.__ModuleLoader__.load({
         roots.length === 0 && state.loading ? h('div', { className: 'mrc-note' }, t('loading')) : null,
         roots.length === 0 && !state.loading ? h('div', { className: 'mrc-note' }, t('empty')) : null,
 
-        h('div', { className: 'mrc-roots' }, roots.map((root) => h(RootSection, {
-          key: root.path,
-          root,
-          t,
-          selected,
-          onSelectEntry,
-          selectedCommit,
-          onSelectCommit,
-          commitLimit: COMMIT_LIMIT
-        }))),
+        // One row: the root list and the preview side by side (see .mrc-body).
+        h('div', { className: 'mrc-body' },
+          h('div', { className: 'mrc-rootsWrap' },
+            h('div', { className: 'mrc-roots' }, roots.map((root) => h(RootSection, {
+              key: root.path,
+              root,
+              t,
+              selected,
+              onSelectEntry,
+              selectedCommit,
+              onSelectCommit,
+              commitLimit: COMMIT_LIMIT,
+              sessionId,
+              onCommitted: () => setTick((value) => value + 1)
+            })))),
 
-        selected !== null
-          ? h('div', { className: 'mrc-diffPane' },
-            h('div', { className: 'mrc-diffBar' },
-              h('span', { className: 'mrc-diffTitle', title: selected.entry.path },
-                `${selected.entry.origPath !== undefined ? `${selected.entry.origPath} → ` : ''}${selected.entry.path}`),
-              h('button', {
-                type: 'button',
-                className: 'mrc-iconButton',
-                title: t('refresh'),
-                'aria-label': t('refresh'),
-                onClick: () => setSelected((prev) => (prev === null ? null : { ...prev }))
-              }, '↻'),
-              h('button', {
-                type: 'button',
-                className: 'mrc-iconButton',
-                title: 'Close',
-                'aria-label': 'Close',
-                onClick: () => setSelected(null)
-              }, '×')),
-            h(DiffView, { key: `${selected.root}:${selected.entry.path}`, root: selected.root, entry: selected.entry, t }))
-          : null,
+          selected !== null
+            ? h('div', { className: 'mrc-diffPane' },
+              h('div', { className: 'mrc-diffBar' },
+                h('span', { className: 'mrc-diffTitle', title: selected.entry.path },
+                  `${selected.entry.origPath !== undefined ? `${selected.entry.origPath} → ` : ''}${selected.entry.path}`),
+                h('button', {
+                  type: 'button',
+                  className: 'mrc-iconButton',
+                  title: t('refresh'),
+                  'aria-label': t('refresh'),
+                  onClick: () => setSelected((prev) => (prev === null ? null : { ...prev }))
+                }, '↻'),
+                h('button', {
+                  type: 'button',
+                  className: 'mrc-iconButton',
+                  title: 'Close',
+                  'aria-label': 'Close',
+                  onClick: () => setSelected(null)
+                }, '×')),
+              h(DiffView, { key: `${selected.root}:${selected.entry.path}`, root: selected.root, entry: selected.entry, t }))
+            : null,
 
-        selectedCommit !== null
-          ? h('div', { className: 'mrc-diffPane' },
-            h('div', { className: 'mrc-diffBar' },
-              h('span', { className: 'mrc-diffTitle', title: selectedCommit.hash },
-                `${selectedCommit.commit.shortHash ?? selectedCommit.hash.slice(0, 7)} · ${selectedCommit.commit.subject}`),
-              h('button', {
-                type: 'button',
-                className: 'mrc-iconButton',
-                title: 'Close',
-                'aria-label': 'Close',
-                onClick: () => setSelectedCommit(null)
-              }, '×')),
-            h(CommitView, { key: `${selectedCommit.root}:${selectedCommit.hash}`, root: selectedCommit.root, hash: selectedCommit.hash, t }))
-          : null);
+          selectedCommit !== null
+            ? h('div', { className: 'mrc-diffPane' },
+              h('div', { className: 'mrc-diffBar' },
+                h('span', { className: 'mrc-diffTitle', title: selectedCommit.hash },
+                  `${selectedCommit.commit.shortHash ?? selectedCommit.hash.slice(0, 7)} · ${selectedCommit.commit.subject}`),
+                h('button', {
+                  type: 'button',
+                  className: 'mrc-iconButton',
+                  title: 'Close',
+                  'aria-label': 'Close',
+                  onClick: () => setSelectedCommit(null)
+                }, '×')),
+              h(CommitView, { key: `${selectedCommit.root}:${selectedCommit.hash}`, root: selectedCommit.root, hash: selectedCommit.hash, t }))
+            : null));
     }
 
     /** The panel's stylesheet, injected once. */
     const STYLE_ID = 'dsh-multi-root-changes-style';
     const CSS = `
+/* A SOLID surface, not a translucent one.
+   Theme plugins (dsh-background-studio's glass mode, for one) rewrite the
+   --dsw-alias-bg-base alias to transparent on #root so wallpapers show through
+   the shell. A panel that paints transparent on top of that inherits the hole:
+   the conversation behind it becomes visible THROUGH this panel, and in
+   fullscreen mode the two layers interleave into exactly the display corruption
+   this rule prevents. Painting layer-1 (an opaque alias) keeps the panel a
+   panel whatever the shell does, and isolation starts a new stacking context
+   so nothing inside can blend with the page behind it either. */
 .mrc-panel { display: flex; flex-direction: column; height: 100%; min-height: 0;
-  color: var(--dsw-alias-label-primary); font-size: 12px; background: transparent; }
+  color: var(--dsw-alias-label-primary); font-size: 12px;
+  background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base, #161b19));
+  background-color: var(--dsw-alias-bg-layer-1, #161b19);
+  isolation: isolate; }
 .mrc-bar { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
-  border-bottom: 1px solid var(--dsw-alias-border-l1); flex: none; }
+  border-bottom: 1px solid var(--dsw-alias-border-l1); flex: none;
+  background: var(--dsw-alias-bg-layer-1, transparent); }
 .mrc-title { font-weight: 600; }
 .mrc-total { color: var(--dsw-alias-label-tertiary); margin-left: auto; font-size: 11px; }
 .mrc-iconButton { border: 0; background: transparent; color: var(--dsw-alias-label-secondary);
@@ -715,9 +840,46 @@ window.__ModuleLoader__.load({
 .mrc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mrc-counts { margin-left: auto; display: flex; gap: 4px; font-size: 10px; flex: none; }
 .mrc-note { padding: 6px 12px; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
+.mrc-ok { color: var(--dsw-alias-state-success-primary); }
+/* The commit box sits between the file tree and the history: message first,
+   then the two actions (AI draft / commit) on one row so the panel stays dense. */
+.mrc-commitBox { border-top: 1px dashed var(--dsw-alias-border-l1); padding: 6px 8px; display: flex;
+  flex-direction: column; gap: 4px; }
+.mrc-commitInput { width: 100%; box-sizing: border-box; resize: vertical; min-height: 34px;
+  font: inherit; font-size: 11px; line-height: 16px; padding: 4px 6px; border-radius: 4px;
+  color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18));
+  border: 1px solid var(--dsw-alias-border-l2); }
+.mrc-commitInput:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
+.mrc-commitActions { display: flex; align-items: center; gap: 6px; }
+.mrc-commitCount { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+.mrc-aiButton { margin-left: auto; border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px;
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+
+  font: inherit; font-size: 11px; padding: 2px 8px; }
+.mrc-aiButton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary); }
+.mrc-commitButton { border: 0; border-radius: 4px; cursor: pointer; font: inherit; font-size: 11px;
+  padding: 3px 10px; font-weight: 600;
+  background: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-bg-base, #fff); }
+.mrc-commitButton:hover:not(:disabled) { filter: brightness(1.08); }
+.mrc-aiButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
+/* Left/right split while a file or commit is open, stacked while it is not.
+   The panel is a narrow column, so a vertical split (tree above, diff below) ate
+   the list down to a few rows; putting the preview BESIDE the list keeps the
+   tree readable at the panel's real width. The data-preview attribute drives the
+   switch — one layout rule, not two component trees. */
+.mrc-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.mrc-panel[data-preview='true'] .mrc-body { flex-direction: row; }
 .mrc-diffPane { flex: none; max-height: 45%; min-height: 120px; display: flex; flex-direction: column;
-  border-top: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-1, #161b19); isolation: isolate; }
+.mrc-panel[data-preview='true'] .mrc-diffPane {
+  flex: 1 1 55%; max-height: none; min-height: 0; min-width: 0;
+  border-top: 0; border-left: 1px solid var(--dsw-alias-border-l1); }
+.mrc-panel[data-preview='true'] .mrc-rootsWrap { flex: 1 1 45%; min-width: 160px; min-height: 0;
+  display: flex; flex-direction: column; border-right: 1px solid var(--dsw-alias-border-l1); }
+.mrc-rootsWrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .mrc-diffBar { display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex: none;
   border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .mrc-diffTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;

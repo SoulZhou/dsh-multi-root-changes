@@ -6,3 +6,6 @@ tests/cdp-*.mjs
 
 screenshots/panel-live.png
 
+
+tests/probe-llm.mjs
+
