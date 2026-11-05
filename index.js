@@ -1,0 +1,636 @@
+/**
+ * Host half of dsh-multi-root-changes.
+ *
+ * Why this plugin exists: DSH's built-in "Changes / Git" panel (and the one
+ * dsh-better-sidebar draws) resolves repositories by scanning DOWNWARD from the
+ * session's working directory. A very common layout — several sibling checkouts
+ * (`F:\AsProject\CanBus`, `F:\AsProject\LibStrProject`, …) beside the primary
+ * project — is therefore invisible: those repositories are not under the
+ * session cwd, so the panel can only ever show the primary project's changes.
+ *
+ * This host half answers the question the panel could not: "for the session's
+ * primary root AND every additional root registered through
+ * @dsh-electron/dsh-plugin-multi-root-workspace, what has changed?" It runs one
+ * `git status` per root and hands the client half a grouped, per-root view, plus
+ * a per-file diff route so the change itself is readable without depending on
+ * another plugin's git routes (those are pinned to the session cwd and would
+ * resolve a sibling root to the wrong repository).
+ *
+ * Everything here is read-only: `git status`, `git rev-parse` and `git diff`.
+ * Nothing is staged, committed, checked out or written.
+ */
+import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+const API = '/dsh-multi-root-changes/api';
+
+/** Per-root ceiling on reported entries (git itself is also asked to stop). */
+const MAX_ENTRIES = 3000;
+/** One git invocation's budget. A stalled mount must not hold the panel. */
+const GIT_TIMEOUT_MS = 20_000;
+/** `git status` stdout ceiling (untracked-heavy trees can be large). */
+const MAX_STATUS_BYTES = 8 * 1024 * 1024;
+/** `git diff` stdout ceiling. */
+const MAX_DIFF_BYTES = 2 * 1024 * 1024;
+/** Untracked-file content ceiling (the "all added" rendering). */
+const MAX_UNTRACKED_BYTES = 1024 * 1024;
+/** Additional roots one slot may report (matches the multi-root plugin's cap). */
+const MAX_ADDITIONAL_ROOTS = 64;
+
+function dshHome() {
+  return process.env.DSH_HOME && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh');
+}
+
+function registryPath() {
+  return join(dshHome(), 'storages', 'multi_root_workspace.json');
+}
+
+function sendJson(response, status, value) {
+  const body = Buffer.from(JSON.stringify(value));
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': body.length,
+    'cache-control': 'no-store'
+  });
+  response.end(body);
+}
+
+function sendText(response, status, text) {
+  const body = Buffer.from(text);
+  response.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'content-length': body.length });
+  response.end(body);
+}
+
+function readBody(request, limit) {
+  return new Promise((resolveBody, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        const error = new Error('body too large');
+        error.status = 413;
+        reject(error);
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on('end', () => resolveBody(Buffer.concat(chunks)));
+    request.on('error', reject);
+  });
+}
+
+async function readJsonBody(request, limit = 256 * 1024) {
+  const raw = await readBody(request, limit);
+  if (raw.length === 0) return {};
+  const parsed = JSON.parse(raw.toString('utf8'));
+  return parsed && typeof parsed === 'object' ? parsed : {};
+}
+
+/** Platform-aware identity used only for comparing absolute roots. */
+function pathIdentity(path) {
+  const absolute = resolve(path).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+}
+
+/** The last path segment of either separator style. */
+function baseName(path) {
+  const at = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  return at === -1 ? path : path.slice(at + 1);
+}
+
+/**
+ * Run one git command and resolve its stdout.
+ *
+ * Rejects with a message that names the command, so the panel can show WHY a
+ * root produced nothing instead of silently dropping it — a missing git binary,
+ * a directory that is not a repository and a locked index are three very
+ * different things to the reader.
+ */
+function runGit(cwd, args, options = {}) {
+  const { timeoutMs = GIT_TIMEOUT_MS, maxBytes = MAX_STATUS_BYTES } = options;
+  return new Promise((resolveRun, rejectRun) => {
+    const child = execFile(
+      'git',
+      ['-c', 'core.quotepath=false', '--no-pager', ...args],
+      {
+        cwd,
+        windowsHide: true,
+        timeout: timeoutMs,
+        maxBuffer: maxBytes,
+        encoding: 'buffer'
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = (stderr && stderr.length > 0 ? stderr.toString('utf8') : error.message).trim();
+          const wrapped = new Error(detail || 'git failed');
+          wrapped.gitArgs = args;
+          wrapped.code = error.code;
+          rejectRun(wrapped);
+          return;
+        }
+        resolveRun(stdout.toString('utf8'));
+      }
+    );
+    child.on('error', rejectRun);
+  });
+}
+
+/**
+ * Split a porcelain-v2 record into its fixed leading fields plus the trailing
+ * path. `count` is the number of leading fields to take; everything after them
+ * is the path (which may itself contain spaces, so it is never re-split).
+ */
+function splitFixed(text, count) {
+  const fields = [];
+  let index = 0;
+  for (let took = 0; took < count; took += 1) {
+    const space = text.indexOf(' ', index);
+    if (space === -1) {
+      fields.push(text.slice(index));
+      return fields;
+    }
+    fields.push(text.slice(index, space));
+    index = space + 1;
+  }
+  fields.push(text.slice(index));
+  return fields;
+}
+
+/**
+ * Parse `git status --porcelain=v2 --branch -z` output.
+ *
+ * Records are NUL-terminated and paths are NOT quoted under `-z`, so a path
+ * with spaces, CJK characters or backslashes arrives verbatim. A rename (`2`)
+ * carries its original path as a SEPARATE NUL-terminated field immediately
+ * after the record — that is why this walks an index instead of mapping each
+ * chunk on its own.
+ */
+function parsePorcelainV2(raw) {
+  const chunks = raw.split('\0');
+  // The trailing NUL produces one empty tail chunk.
+  if (chunks.length > 0 && chunks[chunks.length - 1] === '') chunks.pop();
+
+  const entries = [];
+  let branch;
+  let oid;
+  let upstream;
+  let ahead = 0;
+  let behind = 0;
+  let truncated = false;
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    const record = chunks[index];
+    if (record === '') continue;
+    const kind = record[0];
+
+    if (kind === '#') {
+      // `# branch.oid <sha>` / `# branch.head <name>` / `# branch.upstream <ref>`
+      // / `# branch.ab +<ahead> -<behind>`
+      const rest = record.slice(2);
+      const space = rest.indexOf(' ');
+      const key = space === -1 ? rest : rest.slice(0, space);
+      const value = space === -1 ? '' : rest.slice(space + 1);
+      if (key === 'branch.oid') oid = value;
+      else if (key === 'branch.head') branch = value;
+      else if (key === 'branch.upstream') upstream = value;
+      else if (key === 'branch.ab') {
+        const match = /^\+(\d+)\s+-(\d+)$/.exec(value);
+        if (match) {
+          ahead = Number(match[1]);
+          behind = Number(match[2]);
+        }
+      }
+      continue;
+    }
+
+    if (kind === '?') {
+      if (entries.length >= MAX_ENTRIES) { truncated = true; continue; }
+      entries.push({ path: record.slice(2), x: '?', y: '?', untracked: true });
+      continue;
+    }
+
+    if (kind === '!') {
+      // Ignored entries are not reported: `--ignored` is never passed, so this
+      // branch only fires on a future flag change. Kept so the shape is total.
+      continue;
+    }
+
+    if (kind === '1') {
+      // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>` — seven fixed fields, so
+      // the path is the LAST element `splitFixed` returns. The last field is
+      // taken positionally rather than by hand-counting destructuring slots:
+      // one miscounted elision silently returns a hash as if it were a file
+      // name.
+      const fields = splitFixed(record.slice(2), 7);
+      const path = fields[fields.length - 1];
+      const xy = fields[0];
+      if (path === undefined || xy === undefined || path === '') continue;
+      if (entries.length >= MAX_ENTRIES) { truncated = true; continue; }
+      entries.push({ path, x: xy[0], y: xy[1] });
+      continue;
+    }
+
+    if (kind === '2') {
+      // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>` — eight fixed
+      // fields (the rename score sits where `1` has its last hash).
+      const fields = splitFixed(record.slice(2), 8);
+      const path = fields[fields.length - 1];
+      const xy = fields[0];
+      if (path === undefined || xy === undefined || path === '') continue;
+      // The original path of a rename/copy is the NEXT NUL field.
+      const origPath = chunks[index + 1];
+      if (origPath !== undefined) index += 1;
+      if (entries.length >= MAX_ENTRIES) { truncated = true; continue; }
+      entries.push({ path, origPath, x: xy[0], y: xy[1] });
+      continue;
+    }
+
+    if (kind === 'u') {
+      // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>` — nine fixed
+      // fields (a conflict carries THREE stage hashes).
+      const fields = splitFixed(record.slice(2), 9);
+      const path = fields[fields.length - 1];
+      const xy = fields[0];
+      if (path === undefined || xy === undefined || path === '') continue;
+      if (entries.length >= MAX_ENTRIES) { truncated = true; continue; }
+      entries.push({ path, x: xy[0], y: xy[1], conflict: true });
+      continue;
+    }
+    // Unknown record kinds (future git) are skipped rather than guessed at.
+  }
+
+  return { entries, branch, oid, upstream, ahead, behind, truncated };
+}
+
+/**
+ * Parse `git diff --numstat` output into a path → {additions, deletions} map.
+ *
+ * Binary files report `-` for both counts; they are recorded with 0/0 and a
+ * `binary` flag so the client can label them instead of printing "+0 −0".
+ */
+function parseNumstat(text) {
+  const counts = new Map();
+  for (const line of text.split('\n')) {
+    if (line === '') continue;
+    const firstTab = line.indexOf('\t');
+    if (firstTab === -1) continue;
+    const secondTab = line.indexOf('\t', firstTab + 1);
+    if (secondTab === -1) continue;
+    const added = line.slice(0, firstTab);
+    const deleted = line.slice(firstTab + 1, secondTab);
+    const path = line.slice(secondTab + 1);
+    if (path === '') continue;
+    const binary = added === '-' || deleted === '-';
+    counts.set(path, {
+      additions: binary ? 0 : Number(added) || 0,
+      deletions: binary ? 0 : Number(deleted) || 0,
+      binary
+    });
+  }
+  return counts;
+}
+
+/**
+ * Read the multi-root registry and return the additional roots registered for
+ * one primary root.
+ *
+ * The file is the plugin's own durable store (`$DSH_HOME/storages/
+ * multi_root_workspace.json`), keyed by the PRIMARY root's absolute path. A
+ * missing or unreadable file is not an error: it means "no additional roots",
+ * which is exactly how DSH behaves without that plugin.
+ */
+async function readAdditionalRoots(primaryRoot) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(registryPath(), 'utf8'));
+  } catch {
+    return { roots: [], registryFound: false };
+  }
+  const table = parsed?.tables?.roots;
+  if (!table || typeof table !== 'object') return { roots: [], registryFound: false };
+
+  const wanted = pathIdentity(primaryRoot);
+  let bucket;
+  for (const [key, value] of Object.entries(table)) {
+    if (pathIdentity(key) === wanted) { bucket = value; break; }
+  }
+  if (!bucket || !Array.isArray(bucket.roots)) return { roots: [], registryFound: true };
+
+  const roots = [];
+  for (const row of bucket.roots) {
+    if (roots.length >= MAX_ADDITIONAL_ROOTS) break;
+    const path = typeof row?.path === 'string' && row.path !== '' ? row.path : row?.recordedPath;
+    if (typeof path !== 'string' || path === '') continue;
+    roots.push({
+      path,
+      aliasId: typeof row.aliasId === 'string' ? row.aliasId : undefined,
+      // v0.1.13 stores the grant under `access` / `grant` depending on the
+      // record's age; both spellings are surfaced as `access` and the client
+      // only ever displays it.
+      access: typeof row.access === 'string' ? row.access : (typeof row.grant === 'string' ? row.grant : undefined)
+    });
+  }
+  return { roots, registryFound: true };
+}
+
+/**
+ * Whether one root is a git work tree, and its real top level.
+ *
+ * `git rev-parse --show-toplevel` reports FORWARD slashes with an uppercased
+ * drive letter (`F:/AsProject/CanBus`), while the registry stores backslashes
+ * (`F:\AsProject\CanBus`) — so the comparison goes through {@link pathIdentity}
+ * (slash-normalized, case-insensitive on Windows), never string equality.
+ */
+async function inspectRepo(root) {
+  try {
+    const toplevel = (await runGit(root, ['rev-parse', '--show-toplevel'], { maxBytes: 64 * 1024 })).trim();
+    if (toplevel === '') return { isRepo: false };
+    if (pathIdentity(toplevel) !== pathIdentity(root)) {
+      // `root` sits INSIDE another repository instead of being its own
+      // checkout. Reporting the parent's status here would attribute one
+      // repository's changes to a root that is not that repository.
+      return { isRepo: false, nestedIn: toplevel };
+    }
+    return { isRepo: true, toplevel };
+  } catch (error) {
+    // "Not a repository" is an ordinary state a folder can be in, not a
+    // failure: only a real problem (missing git, a locked index) keeps an
+    // `error` the panel must surface verbatim.
+    const message = error.message || '';
+    if (/not a git repository|not a git work tree/i.test(message)) return { isRepo: false };
+    return { isRepo: false, error: message };
+  }
+}
+
+/** One root's complete read-only status reading. */
+async function readRootStatus(root) {
+  const repo = await inspectRepo(root);
+  if (repo.isRepo !== true) {
+    return {
+      ...repo,
+      entries: [],
+      counts: {},
+      branch: undefined,
+      ahead: 0,
+      behind: 0,
+      truncated: false
+    };
+  }
+
+  let raw;
+  try {
+    raw = await runGit(root, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']);
+  } catch (error) {
+    return {
+      isRepo: true,
+      toplevel: repo.toplevel,
+      error: error.message,
+      entries: [],
+      counts: {},
+      truncated: false
+    };
+  }
+
+  const parsed = parsePorcelainV2(raw);
+
+  // Line counts are a nicety: a numstat failure must cost only the numbers,
+  // never the status answer itself.
+  let staged = new Map();
+  let unstaged = new Map();
+  if (parsed.entries.length > 0) {
+    try {
+      const [unstagedText, stagedText] = await Promise.all([
+        runGit(root, ['diff', '--numstat']).catch(() => ''),
+        runGit(root, ['diff', '--cached', '--numstat']).catch(() => '')
+      ]);
+      unstaged = parseNumstat(unstagedText);
+      staged = parseNumstat(stagedText);
+    } catch { /* counts stay empty */ }
+  }
+
+  // Fold the two numstat readings onto the entries: each side keeps its own
+  // numbers (a path changed on both sides is not one summed count).
+  const counts = {};
+  for (const entry of parsed.entries) {
+    const stagedCount = staged.get(entry.path);
+    const unstagedCount = unstaged.get(entry.path);
+    if (stagedCount !== undefined || unstagedCount !== undefined) {
+      counts[entry.path] = {
+        ...(stagedCount !== undefined ? { staged: stagedCount } : {}),
+        ...(unstagedCount !== undefined ? { unstaged: unstagedCount } : {})
+      };
+    }
+  }
+
+  return {
+    isRepo: true,
+    toplevel: repo.toplevel,
+    // A detached HEAD reports the literal string `HEAD`; there is no branch to
+    // name, and presenting "HEAD" as a branch would read as one.
+    branch: parsed.branch === '(detached)' || parsed.branch === 'HEAD' ? undefined : parsed.branch,
+    detached: parsed.branch === '(detached)' || parsed.branch === 'HEAD',
+    oid: parsed.oid,
+    upstream: parsed.upstream,
+    ahead: parsed.ahead,
+    behind: parsed.behind,
+    entries: parsed.entries,
+    counts,
+    truncated: parsed.truncated
+  };
+}
+
+/** The label a root is drawn under: its own directory name. */
+function labelOf(path) {
+  return baseName(path);
+}
+
+/**
+ * Resolve the authoritative working directory for one request.
+ *
+ * The client's `scope.cwd` is the session-list summary captured when the
+ * session STARTED; the host can follow the agent into a different directory
+ * (and the multi-root plugin's scope follows the same value). The host is the
+ * authority, so a `sessionId` is resolved here and the client hint is only a
+ * fallback for a composition without the working-directory service.
+ */
+function resolveSessionCwd(ctx, sessionId, clientCwd) {
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    try {
+      const session = ctx.get('sessions')?.get?.(sessionId);
+      if (session !== undefined) {
+        const live = ctx.get('workingDirectory')?.get?.(session);
+        if (typeof live === 'string' && live !== '') return live;
+        if (typeof session.header?.cwd === 'string' && session.header.cwd !== '') return session.header.cwd;
+      }
+    } catch { /* fall through to the client hint */ }
+  }
+  return typeof clientCwd === 'string' && clientCwd !== '' ? clientCwd : '';
+}
+
+/**
+ * Build the complete state answer: the primary root plus every registered
+ * additional root, each with its own git reading.
+ *
+ * A root that fails is still reported (with `error`), never dropped — "this
+ * folder has no changes I can read" and "this folder is not on the list" are
+ * different messages and only one of them is true.
+ */
+async function handleState(ctx, request, response) {
+  const body = await readJsonBody(request);
+  const resolvedCwd = resolveSessionCwd(ctx, body.sessionId, body.cwd);
+  if (resolvedCwd === '') {
+    sendJson(response, 400, { error: 'cwd or sessionId is required' });
+    return;
+  }
+  const primaryRoot = resolve(resolvedCwd);
+  const registry = await readAdditionalRoots(primaryRoot);
+
+  const targets = [
+    { path: primaryRoot, kind: 'primary', label: labelOf(primaryRoot) },
+    ...registry.roots
+      // A registration that canonicalizes onto the primary root adds nothing.
+      .filter((row) => pathIdentity(row.path) !== pathIdentity(primaryRoot))
+      .map((row) => ({
+        path: row.path,
+        kind: 'additional',
+        label: labelOf(row.path),
+        aliasId: row.aliasId,
+        access: row.access
+      }))
+  ];
+
+  const readings = await Promise.all(targets.map(async (target) => {
+    try {
+      const status = await readRootStatus(target.path);
+      return { ...target, status };
+    } catch (error) {
+      return {
+        ...target,
+        status: { isRepo: false, error: error.message, entries: [], counts: {}, truncated: false }
+      };
+    }
+  }));
+
+  sendJson(response, 200, {
+    primaryRoot,
+    registryFound: registry.registryFound,
+    roots: readings
+  });
+}
+
+/**
+ * Whether a byte buffer looks like binary content.
+ *
+ * A NUL byte in the first stretch is the same heuristic git itself uses: an
+ * untracked `.aar`/`.jar`/image has no diff AND no meaningful text, so decoding
+ * it as UTF-8 would render megabytes of replacement characters.
+ */
+function looksBinary(buffer) {
+  const limit = Math.min(buffer.length, 8000);
+  for (let index = 0; index < limit; index += 1) {
+    if (buffer[index] === 0) return true;
+  }
+  return false;
+}
+
+/**
+ * One file's diff, read from the root the file actually belongs to.
+ *
+ * `staged` selects index-vs-HEAD; the default is worktree-vs-index. An untracked
+ * file has no diff at all, so its CONTENT is returned with an all-added flag and
+ * the client renders it as a fresh file — the same thing git would show.
+ */
+async function handleDiff(request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  const path = typeof body.path === 'string' ? body.path : '';
+  if (root === '' || path === '') {
+    sendText(response, 400, 'root and path are required');
+    return;
+  }
+
+  const staged = body.staged === true;
+  const untracked = body.untracked === true;
+  const origPath = typeof body.origPath === 'string' && body.origPath !== '' ? body.origPath : undefined;
+
+  try {
+    if (untracked) {
+      const content = await readFile(join(root, path));
+      // A binary file has nothing a text pane can show; say so instead of
+      // streaming replacement characters into the reader.
+      if (looksBinary(content)) {
+        sendJson(response, 200, { kind: 'binary', size: content.length });
+        return;
+      }
+      const clipped = content.length > MAX_UNTRACKED_BYTES ? content.subarray(0, MAX_UNTRACKED_BYTES) : content;
+      sendJson(response, 200, {
+        kind: 'untracked',
+        content: clipped.toString('utf8'),
+        size: content.length,
+        truncated: content.length > MAX_UNTRACKED_BYTES
+      });
+      return;
+    }
+
+    const args = ['diff', '--no-color', '-M', '-U3'];
+    if (staged) args.push('--cached');
+    // Both sides of a rename are named so the pathspec matches whichever
+    // spelling git recorded the change under.
+    const paths = origPath !== undefined && origPath !== path ? [origPath, path] : [path];
+    args.push('--', ...paths);
+
+    const text = await runGit(root, args, { maxBytes: MAX_DIFF_BYTES });
+    sendJson(response, 200, {
+      kind: 'diff',
+      patch: text,
+      truncated: Buffer.byteLength(text, 'utf8') >= MAX_DIFF_BYTES
+    });
+  } catch (error) {
+    sendText(response, error.status ?? 500, error.message || 'diff failed');
+  }
+}
+
+export function apply(ctx) {
+  ctx.inject(['webServer'], (host) => {
+    host.effect(() => {
+      const routes = [
+        {
+          path: `${API}/state`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleState(host, request, response);
+          }
+        },
+        {
+          path: `${API}/diff`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleDiff(request, response);
+          }
+        }
+      ];
+
+      const disposers = routes.map((route) => host.webServer.register({
+        kind: 'exact',
+        path: route.path,
+        handler: (request, response) => {
+          Promise.resolve()
+            .then(() => route.handler(request, response))
+            .catch((error) => {
+              const status = Number.isInteger(error?.status) ? error.status : 500;
+              if (!response.headersSent) sendText(response, status, status === 413 ? 'body too large' : 'internal error');
+              else response.end();
+            });
+        }
+      }));
+
+      return () => { for (const dispose of disposers) { try { dispose?.(); } catch { /* already gone */ } } };
+    }, 'multi-root-changes: routes');
+  });
+}
+
+export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity };

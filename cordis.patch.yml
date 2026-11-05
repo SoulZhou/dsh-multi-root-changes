@@ -1,0 +1,9 @@
+# dsh-multi-root-changes bundle patch
+#
+# One insert of this plugin's own row. The host half registers the same-origin
+# JSON routes the client half reads; the client half registers a sidebar tab
+# through `ctx.betterSidebar` (dsh-better-sidebar), so no profile file edits are
+# needed beyond the bundle registration `dsh plugin add` performs.
+- insert:
+    - id: multi-root-changes
+      name: 'dsh-multi-root-changes'
