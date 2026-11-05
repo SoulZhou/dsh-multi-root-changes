@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Storefront tile: the panel's own branch glyph, drawn large on a dark
+       rounded square so it reads at 96px in a plugin grid. -->
+  <rect width="512" height="512" rx="112" fill="#121a24" />
+  <g fill="none" stroke="#7fe3c4" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M170 150v170" />
+    <circle cx="170" cy="372" r="40" />
+    <circle cx="170" cy="150" r="40" />
+    <path d="M170 256h96a56 56 0 0 1 56 56v20" />
+    <circle cx="362" cy="372" r="40" />
+  </g>
+</svg>

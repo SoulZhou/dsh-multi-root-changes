@@ -1,0 +1,54 @@
+{
+  "name": "dsh-multi-root-changes",
+  "version": "0.1.0",
+  "description": "Multi-root changes panel for DeepSeek Harness: one Git changes view that covers the session's primary workspace root AND every writable additional root registered through multi-root-workspace.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SoulZhou/dsh-multi-root-changes.git"
+  },
+  "homepage": "https://github.com/SoulZhou/dsh-multi-root-changes#readme",
+  "bugs": {
+    "url": "https://github.com/SoulZhou/dsh-multi-root-changes/issues"
+  },
+  "icon": "./icon.svg",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets/icon-512.png",
+    "screenshots.json",
+    "README.md",
+    "LICENSE",
+    "screenshots/*.png"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "git",
+    "changes",
+    "multi-root"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  }
+}
