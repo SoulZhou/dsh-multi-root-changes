@@ -35,6 +35,8 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'multi-root-changes';
     /** How often the panel re-reads status while it is on screen. */
     const POLL_MS = 8000;
+    /** Commits fetched per root when a history section is expanded. */
+    const COMMIT_LIMIT = 30;
 
     const COPY = {
       zh: {
@@ -60,7 +62,10 @@ window.__ModuleLoader__.load({
         staged: '已暂存',
         selectRoot: '选择目录',
         detached: '游离 HEAD',
-        tooLarge: '文件过大，仅显示前一部分'
+        tooLarge: '文件过大，仅显示前一部分',
+        commits: '提交历史',
+        noCommits: '这个仓库还没有提交',
+        mergeCommit: '合并提交（{count} 个父提交），无单一差异'
       },
       en: {
         tab: 'Multi-root changes',
@@ -85,7 +90,10 @@ window.__ModuleLoader__.load({
         staged: 'Staged',
         selectRoot: 'Choose a folder',
         detached: 'Detached HEAD',
-        tooLarge: 'File too large; showing the beginning only'
+        tooLarge: 'File too large; showing the beginning only',
+        commits: 'Commit history',
+        noCommits: 'This repository has no commits yet',
+        mergeCommit: 'Merge commit ({count} parents) — no single diff to show'
       }
     };
 
@@ -154,6 +162,26 @@ window.__ModuleLoader__.load({
     function baseName(path) {
       const at = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
       return at === -1 ? path : path.slice(at + 1);
+    }
+
+    /**
+     * A commit timestamp (unix SECONDS, as `%at` prints it) in the reader's own
+     * zone and locale. Recent commits read as an hour/day count because that is
+     * what a history list is scanned for; older ones fall back to a date.
+     */
+    function formatTime(seconds) {
+      if (!Number.isFinite(seconds) || seconds <= 0) return '';
+      const then = new Date(seconds * 1000);
+      const diffMs = Date.now() - then.getTime();
+      const minutes = Math.floor(diffMs / 60000);
+      if (minutes < 1) return isZh() ? '刚刚' : 'just now';
+      if (minutes < 60) return isZh() ? `${minutes} 分钟前` : `${minutes}m ago`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return isZh() ? `${hours} 小时前` : `${hours}h ago`;
+      const days = Math.floor(hours / 24);
+      if (days < 30) return isZh() ? `${days} 天前` : `${days}d ago`;
+      const pad = (value) => String(value).padStart(2, '0');
+      return `${then.getFullYear()}-${pad(then.getMonth() + 1)}-${pad(then.getDate())}`;
     }
 
     /**
@@ -246,6 +274,60 @@ window.__ModuleLoader__.load({
         open ? h('div', null, node.children.map((child, index) => render(child, depth + 1, `${node.name}:${index}`))) : null);
     }
 
+    /**
+     * Render a unified patch by KEEPING git's own hunk structure: header lines
+     * start a new section, `+`/`-` lines are the content, everything else is
+     * context. Nothing is recomputed or re-numbered — the numbers git printed
+     * are the numbers shown.
+     *
+     * Shared by the working-tree diff and a commit's patch: both are the same
+     * format, and two renderers would drift apart on the first fix.
+     */
+    function DiffBody(props) {
+      const { patch, note } = props;
+      const rows = [];
+      let oldNo = 0;
+      let newNo = 0;
+      for (const line of patch.split('\n')) {
+        if (line.startsWith('@@')) {
+          const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+          if (match) { oldNo = Number(match[1]); newNo = Number(match[2]); }
+          rows.push(h('div', { key: rows.length, className: 'mrc-hunk' }, line));
+          continue;
+        }
+        if (line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('--- ')
+          || line.startsWith('+++ ') || line.startsWith('new file') || line.startsWith('deleted file')
+          || line.startsWith('similarity') || line.startsWith('rename ') || line.startsWith('old mode')
+          || line.startsWith('new mode') || line.startsWith('Binary files')) {
+          rows.push(h('div', { key: rows.length, className: 'mrc-fileHead' }, line));
+          continue;
+        }
+        if (line.startsWith('+')) {
+          rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineAdd' },
+            h('span', { className: 'mrc-lineNo' }, String(newNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+          newNo += 1;
+          continue;
+        }
+        if (line.startsWith('-')) {
+          rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineDel' },
+            h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+          oldNo += 1;
+          continue;
+        }
+        if (line.startsWith('\\')) {
+          rows.push(h('div', { key: rows.length, className: 'mrc-fileHead' }, line));
+          continue;
+        }
+        rows.push(h('div', { key: rows.length, className: 'mrc-line' },
+          h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+        oldNo += 1;
+        newNo += 1;
+      }
+      return h('div', { className: 'mrc-diff' },
+        note !== undefined ? h('div', { className: 'mrc-diffNote' }, note) : null,
+        rows);
+    }
+
     /** The diff reader: a unified patch, or a new file's whole content. */
     function DiffView(props) {
       const { root, entry, t } = props;
@@ -290,52 +372,105 @@ window.__ModuleLoader__.load({
       const patch = String(data.patch ?? '');
       if (patch.trim() === '') return h('div', { className: 'mrc-diffNote' }, t('diffEmpty'));
 
-      // A patch is rendered by KEEPING git's own hunk structure: header lines
-      // start a new section, +/- lines are the content, and everything else is
-      // context. Nothing needs to be recomputed or re-numbered.
+      return h(DiffBody, { patch });
+    }
+
+    /** A commit's own diff, read from the root that owns it. */
+    function CommitView(props) {
+      const { root, hash, t } = props;
+      const [state, setState] = useState({ loading: true, error: null, data: null });
+
+      useEffect(() => {
+        let live = true;
+        setState({ loading: true, error: null, data: null });
+        postJson('/commit', { root, hash })
+          .then((data) => { if (live) setState({ loading: false, error: null, data }); })
+          .catch((error) => { if (live) setState({ loading: false, error: error.message, data: null }); });
+        return () => { live = false; };
+      }, [root, hash]);
+
+      if (state.loading) return h('div', { className: 'mrc-diffNote' }, t('loading'));
+      if (state.error !== null) return h('div', { className: 'mrc-diffNote mrc-error' }, `${t('diffFailed')}: ${state.error}`);
+      const data = state.data;
+      if (data === null || data.kind !== 'commit') return h('div', { className: 'mrc-diffNote' }, t('diffEmpty'));
+
+      const meta = data.meta ?? {};
       const rows = [];
-      let oldNo = 0;
-      let newNo = 0;
-      for (const line of patch.split('\n')) {
-        if (line.startsWith('@@')) {
-          const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-          if (match) { oldNo = Number(match[1]); newNo = Number(match[2]); }
-          rows.push(h('div', { key: rows.length, className: 'mrc-hunk' }, line));
-          continue;
-        }
-        if (line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('--- ')
-          || line.startsWith('+++ ') || line.startsWith('new file') || line.startsWith('deleted file')
-          || line.startsWith('similarity') || line.startsWith('rename ')) {
-          rows.push(h('div', { key: rows.length, className: 'mrc-fileHead' }, line));
-          continue;
-        }
-        if (line.startsWith('+')) {
-          rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineAdd' },
-            h('span', { className: 'mrc-lineNo' }, String(newNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
-          newNo += 1;
-          continue;
-        }
-        if (line.startsWith('-')) {
-          rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineDel' },
-            h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
-          oldNo += 1;
-          continue;
-        }
-        if (line.startsWith('\\')) {
-          rows.push(h('div', { key: rows.length, className: 'mrc-fileHead' }, line));
-          continue;
-        }
-        rows.push(h('div', { key: rows.length, className: 'mrc-line' },
-          h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
-        oldNo += 1;
-        newNo += 1;
+      rows.push(h('div', { key: 'meta', className: 'mrc-commitMeta' },
+        h('div', { className: 'mrc-commitHash' }, meta.shortHash ?? hash),
+        h('div', { className: 'mrc-commitAuthor' }, `${meta.author ?? ''} · ${formatTime(meta.timestamp)}`),
+        data.merge === true
+          ? h('div', { className: 'mrc-diffNote' }, t('mergeCommit', { count: data.parentCount ?? 0 }))
+          : null,
+        meta.body !== undefined && meta.body !== ''
+          ? h('div', { className: 'mrc-commitBody' }, meta.body)
+          : null));
+
+      if (data.merge !== true && typeof data.patch === 'string' && data.patch !== '') {
+        rows.push(h(DiffBody, { key: 'patch', patch: data.patch, t }));
       }
       return h('div', { className: 'mrc-diff' }, rows);
     }
 
+    /** One root's collapsible commit history. */
+    function CommitSection(props) {
+      const { root, t, selected, onSelectCommit, limit } = props;
+      const [open, setOpen] = useState(false);
+      const [state, setState] = useState({ loading: false, error: null, commits: [], hasCommits: true });
+
+      useEffect(() => {
+        if (!open) return undefined;
+        let live = true;
+        setState((prev) => ({ ...prev, loading: true, error: null }));
+        postJson('/log', { roots: [root.path], limit })
+          .then((data) => {
+            if (!live) return;
+            const reading = Array.isArray(data.roots) && data.roots.length > 0 ? data.roots[0] : null;
+            if (reading === null || reading.isRepo !== true) {
+              setState({ loading: false, error: reading?.error ?? null, commits: [], hasCommits: false });
+              return;
+            }
+            setState({ loading: false, error: null, commits: reading.commits ?? [], hasCommits: reading.hasCommits !== false });
+          })
+          .catch((error) => { if (live) setState({ loading: false, error: error.message, commits: [], hasCommits: false }); });
+        return () => { live = false; };
+      }, [open, root.path, limit]);
+
+      return h('div', { className: 'mrc-commits' },
+        h('button', {
+          type: 'button',
+          className: 'mrc-commitToggle',
+          onClick: () => setOpen((value) => !value),
+          'aria-expanded': open
+        },
+        h('span', { className: open ? 'mrc-caret mrc-caretOpen' : 'mrc-caret' }, '▸'),
+        h('span', null, t('commits'))),
+        open ? h('div', { className: 'mrc-commitList' },
+          state.loading ? h('div', { className: 'mrc-note' }, t('loading')) : null,
+          state.error !== null ? h('div', { className: 'mrc-note mrc-error' }, `${t('readFailed')}: ${state.error}`) : null,
+          !state.loading && state.error === null && state.hasCommits === false
+            ? h('div', { className: 'mrc-note' }, t('noCommits'))
+            : null,
+          state.commits.map((commit) => {
+            const isSelected = selected !== null && selected.root === root.path && selected.hash === commit.hash;
+            return h('button', {
+              key: commit.hash,
+              type: 'button',
+              className: isSelected ? 'mrc-commitRow mrc-rowActive' : 'mrc-commitRow',
+              title: `${commit.hash}\n${commit.author} · ${formatTime(commit.timestamp)}`,
+              onClick: () => onSelectCommit(root.path, commit)
+            },
+            h('span', { className: 'mrc-commitDot' }, '●'),
+            h('span', { className: 'mrc-commitSubject' }, commit.subject),
+            commit.refs.length > 0 ? h('span', { className: 'mrc-ref' }, commit.refs[0]) : null,
+            h('span', { className: 'mrc-commitWhen' }, formatTime(commit.timestamp)));
+          }))
+          : null);
+    }
+
     /** One root's collapsible section: header, counters, tree. */
     function RootSection(props) {
-      const { root, t, selected, onSelectEntry } = props;
+      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit } = props;
       const status = root.status ?? {};
       const entries = Array.isArray(status.entries) ? status.entries : [];
       const [open, setOpen] = useState(true);
@@ -397,7 +532,16 @@ window.__ModuleLoader__.load({
             : null,
           hasRepo && entries.length === 0 ? h('div', { className: 'mrc-note' }, t('emptyRoot')) : null,
           hasRepo && status.truncated === true ? h('div', { className: 'mrc-note' }, t('truncated')) : null,
-          hasRepo && tree.length > 0 ? h('div', { className: 'mrc-tree' }, tree.map((node, index) => renderNode(node, 0, `${root.path}:${index}`))) : null)
+          hasRepo && tree.length > 0 ? h('div', { className: 'mrc-tree' }, tree.map((node, index) => renderNode(node, 0, `${root.path}:${index}`))) : null,
+          hasRepo
+            ? h(CommitSection, {
+              root,
+              t,
+              limit: commitLimit,
+              selected: selectedCommit,
+              onSelectCommit
+            })
+            : null)
           : null);
     }
 
@@ -409,6 +553,7 @@ window.__ModuleLoader__.load({
       const cwd = scope?.cwd;
       const [state, setState] = useState({ loading: true, error: null, data: null });
       const [selected, setSelected] = useState(null);
+      const [selectedCommit, setSelectedCommit] = useState(null);
       const [tick, setTick] = useState(0);
       // A parked tab body polls nothing; the host keeps every visited tab body
       // mounted, so an ungated timer would run panels nobody can see.
@@ -428,9 +573,20 @@ window.__ModuleLoader__.load({
       }, [onScreen, sessionId, cwd, tick]);
 
       const onSelectEntry = useCallback((root, entry) => {
+        // A file and a commit share the ONE preview pane: opening either retires
+        // the other, so the pane never claims to show two things at once.
+        setSelectedCommit(null);
         setSelected((prev) => {
           if (prev !== null && prev.root === root && prev.entry.path === entry.path) return null;
           return { root, entry };
+        });
+      }, []);
+
+      const onSelectCommit = useCallback((root, commit) => {
+        setSelected(null);
+        setSelectedCommit((prev) => {
+          if (prev !== null && prev.root === root && prev.hash === commit.hash) return null;
+          return { root, hash: commit.hash, commit };
         });
       }, []);
 
@@ -465,7 +621,10 @@ window.__ModuleLoader__.load({
           root,
           t,
           selected,
-          onSelectEntry
+          onSelectEntry,
+          selectedCommit,
+          onSelectCommit,
+          commitLimit: COMMIT_LIMIT
         }))),
 
         selected !== null
@@ -488,6 +647,21 @@ window.__ModuleLoader__.load({
                 onClick: () => setSelected(null)
               }, '×')),
             h(DiffView, { key: `${selected.root}:${selected.entry.path}`, root: selected.root, entry: selected.entry, t }))
+          : null,
+
+        selectedCommit !== null
+          ? h('div', { className: 'mrc-diffPane' },
+            h('div', { className: 'mrc-diffBar' },
+              h('span', { className: 'mrc-diffTitle', title: selectedCommit.hash },
+                `${selectedCommit.commit.shortHash ?? selectedCommit.hash.slice(0, 7)} · ${selectedCommit.commit.subject}`),
+              h('button', {
+                type: 'button',
+                className: 'mrc-iconButton',
+                title: 'Close',
+                'aria-label': 'Close',
+                onClick: () => setSelectedCommit(null)
+              }, '×')),
+            h(CommitView, { key: `${selectedCommit.root}:${selectedCommit.hash}`, root: selectedCommit.root, hash: selectedCommit.hash, t }))
           : null);
     }
 
@@ -559,6 +733,28 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-bg-layer-2); white-space: pre; }
 .mrc-fileHead { padding: 1px 8px; color: var(--dsw-alias-label-tertiary); white-space: pre; }
 .mrc-diffNote { padding: 8px 12px; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
+.mrc-commits { border-top: 1px dashed var(--dsw-alias-border-l1); margin-top: 2px; }
+.mrc-commitToggle { display: flex; align-items: center; gap: 6px; width: 100%; border: 0;
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  font: inherit; text-align: left; padding: 4px 8px; font-size: 11px; }
+.mrc-commitToggle:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mrc-commitList { display: flex; flex-direction: column; padding-bottom: 4px; }
+.mrc-commitRow { display: flex; align-items: center; gap: 6px; width: 100%; border: 0;
+  background: transparent; color: inherit; cursor: pointer; font: inherit; text-align: left;
+  padding: 2px 8px 2px 20px; line-height: 18px; font-size: 11px; }
+.mrc-commitRow:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mrc-commitDot { color: var(--dsw-alias-state-business-primary); font-size: 8px; flex: none; }
+.mrc-commitSubject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.mrc-commitWhen { color: var(--dsw-alias-label-tertiary); font-size: 10px; flex: none; }
+.mrc-ref { font-size: 9px; padding: 0 4px; border-radius: 3px; flex: none; max-width: 110px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dsw-alias-state-business-primary); border: 1px solid var(--dsw-alias-border-l2); }
+.mrc-commitMeta { padding: 8px 12px 4px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.mrc-commitHash { font-family: var(--ds-font-family-code); font-size: 11px;
+  color: var(--dsw-alias-state-business-primary); }
+.mrc-commitAuthor { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 2px; }
+.mrc-commitBody { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 6px;
+  white-space: pre-wrap; }
 `;
 
     function ensureStyle() {
@@ -632,7 +828,7 @@ window.__ModuleLoader__.load({
     }
 
     const module = { exports: { apply, name: 'dsh-multi-root-changes' } };
-    module.exports.__test = { buildTree, statusLetter, baseName };
+    module.exports.__test = { buildTree, statusLetter, baseName, formatTime };
     return module.exports;
   }
 });
