@@ -16,8 +16,10 @@
  * another plugin's git routes (those are pinned to the session cwd and would
  * resolve a sibling root to the wrong repository).
  *
- * Everything here is read-only: `git status`, `git rev-parse` and `git diff`.
- * Nothing is staged, committed, checked out or written.
+ * Reads (`status` / `rev-parse` / `log` / `show` / `diff`) never touch the
+ * repository. The ONE write path is `/commit`, which stages the named files and
+ * creates a commit — it is explicit, takes an explicit file list, and is the
+ * only place this plugin runs `git add` or `git commit`.
  */
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
@@ -38,6 +40,14 @@ const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 const MAX_UNTRACKED_BYTES = 1024 * 1024;
 /** Additional roots one slot may report (matches the multi-root plugin's cap). */
 const MAX_ADDITIONAL_ROOTS = 64;
+/** Diff characters fed to the model when drafting a commit message. */
+const SUGGEST_DIFF_LIMIT = 12_000;
+/** Output budget of one commit-message draft. */
+const SUGGEST_MAX_TOKENS = 512;
+/** Hard deadline of one draft (a stalled provider must not hang the panel). */
+const SUGGEST_TIMEOUT_MS = 30_000;
+/** A commit message longer than this is almost certainly not a message. */
+const MAX_COMMIT_MESSAGE_BYTES = 8 * 1024;
 
 function dshHome() {
   return process.env.DSH_HOME && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh');
@@ -538,6 +548,237 @@ function looksBinary(buffer) {
 }
 
 /**
+ * Resolve one requested revision against a root's actual history.
+ *
+ * A commit id from the client is untrusted input that reaches a command line,
+ * so it is first narrowed to plain hex (which cannot be read as a flag or a rev
+ * expression) and then resolved to the FULL id git reports. The client's own
+ * short hash is never trusted as the identity of anything.
+ */
+async function resolveRevision(root, hash) {
+  if (typeof hash !== 'string' || !/^[0-9a-f]{4,64}$/i.test(hash)) {
+    const error = new Error('hash must be a hex object id');
+    error.status = 400;
+    throw error;
+  }
+  const out = (await runGit(root, ['rev-parse', '--verify', '--quiet', `${hash}^{commit}`], { maxBytes: 16 * 1024 })).trim();
+  if (out === '') {
+    const error = new Error('unknown revision');
+    error.status = 404;
+    throw error;
+  }
+  return out;
+}
+
+/**
+ * Draft a commit message from the staged/unstaged changes of ONE root.
+ *
+ * The model route is resolved the same way the harness resolves it for a
+ * conversation: the session's own route first (so the draft matches the model
+ * the user is already talking to), then the harness default. The plugin holds
+ * no credential — `ctx.llm` resolves provider endpoints and keys.
+ */
+async function draftCommitMessage(ctx, root, sessionId, language, focus) {
+  const llm = ctx.get('llm');
+  if (llm === undefined || typeof llm.stream !== 'function') {
+    const error = new Error('the harness LLM service is unavailable');
+    error.status = 503;
+    throw error;
+  }
+
+  const route = conversationRouteOf(ctx, sessionId) ?? defaultRouteOf(ctx);
+  if (route === undefined) {
+    const error = new Error('cannot resolve a model route for this conversation');
+    error.status = 503;
+    throw error;
+  }
+
+  // The focus is what the user is about to commit: the staged set when there is
+  // one, otherwise the worktree set. Sending the OTHER side's diff would ask the
+  // model to describe changes that are not in the commit.
+  const args = ['diff', '--no-color', '-M', '-U2'];
+  if (focus === 'staged') args.push('--cached');
+  const diffText = await runGit(root, args, { maxBytes: MAX_DIFF_BYTES }).catch(() => '');
+  const changedPaths = await runGit(root, focus === 'staged'
+    ? ['diff', '--cached', '--name-only']
+    : ['status', '--porcelain=v1', '--untracked-files=all'], { maxBytes: 512 * 1024 })
+    .catch(() => '');
+
+  const clipped = diffText.length > SUGGEST_DIFF_LIMIT
+    ? `${diffText.slice(0, SUGGEST_DIFF_LIMIT)}\n...(diff truncated)`
+    : diffText;
+
+  const zh = language === 'zh';
+  const system = zh
+    ? '你是一个 Git 提交信息生成器。根据给定的改动，输出一条简洁的中文提交信息。'
+      + '第一行是摘要（不超过 50 个字符，不要句号），如果改动较多可以空一行后补充几条要点。'
+      + '只输出提交信息本身，不要解释、不要代码块、不要引号。'
+    : 'You are a Git commit message generator. Given the changes, output a concise commit message. '
+      + 'The first line is a subject (max 50 characters, no trailing period); if the change is large, '
+      + 'add bullets after a blank line. Output ONLY the message — no explanation, no code fence, no quotes.';
+  const user = zh
+    ? `仓库改动如下：\n\n文件：\n${changedPaths}\n\n差异：\n${clipped || '(无文本差异)'}`
+    : `Changes in this repository:\n\nFiles:\n${changedPaths}\n\nDiff:\n${clipped || '(no textual diff)'}`;
+
+  // Assemble the stream WITHOUT importing `@deepseek-ai/dsh-llm`: that package
+  // is a peer the harness resolves inside its own runtime, and a static import
+  // of it would make this plugin fail to load on a profile where it is not on
+  // the resolution path. The chunks are plain text deltas, so concatenating them
+  // is the whole assembly step.
+  const pieces = [];
+  const shapes = [];
+  let failureReason;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), SUGGEST_TIMEOUT_MS);
+  try {
+    for await (const chunk of llm.stream({
+      provider: route.provider,
+      model: route.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+      system,
+      maxTokens: SUGGEST_MAX_TOKENS,
+      signal: controller.signal
+    })) {
+      // A `finish` chunk carries the provider's verdict. A failed one (no API
+      // key, an unsupported model, a refused request) must be reported as THAT
+      // failure, not as the "empty message" it would otherwise look like.
+      if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') {
+        const failure = chunk.reason.failure;
+        failureReason = typeof failure?.message === 'string' && failure.message !== ''
+          ? failure.message
+          : 'the model route failed';
+        continue;
+      }
+      if (shapes.length < 3) shapes.push(String(chunk?.type ?? '(untyped)'));
+      const text = textOfChunk(chunk);
+      if (text !== '') pieces.push(text);
+    }
+  } catch (error) {
+    if (error?.name === 'AbortError' || controller.signal.aborted) {
+      const timeout = new Error(`the model did not answer within ${Math.round(SUGGEST_TIMEOUT_MS / 1000)}s`);
+      timeout.status = 504;
+      throw timeout;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (failureReason !== undefined) {
+    const error = new Error(failureReason);
+    error.status = 502;
+    throw error;
+  }
+
+  const message = pieces.join('').trim();
+  if (message === '') {
+    const error = new Error(`the model returned no text (chunks seen: ${shapes.join(', ') || 'none'})`);
+    error.status = 502;
+    throw error;
+  }
+  return { message, provider: route.provider, model: route.model };
+}
+
+/**
+ * The text carried by one streaming chunk.
+ *
+ * The harness's own union (verified against the shipped type declarations, not
+ * guessed):
+ *
+ *   { type: 'text-delta',      index, text }
+ *   { type: 'reasoning-delta', index, text }
+ *   { type: 'tool-call-delta', index, id, name?, argumentsDelta }
+ *   { type: 'block-start' | 'block-end' | 'usage' | 'finish' }
+ *
+ * Only `text-delta` is assistant PROSE — a `reasoning-delta` is the model
+ * thinking and a `tool-call-delta` is arguments, so folding those in would put
+ * the model's scratchpad into a commit message. Any chunk that is not a
+ * `text-delta` contributes nothing.
+ */
+function textOfChunk(chunk) {
+  if (chunk === null || chunk === undefined) return '';
+  if (typeof chunk === 'string') return chunk;
+  if (chunk.type === 'text-delta' && typeof chunk.text === 'string') return chunk.text;
+  return '';
+}
+
+/** The provider/model the given session last ran on, if it ever ran. */
+function conversationRouteOf(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+  try {
+    const agents = ctx.get('agents');
+    const options = agents?.get?.(sessionId)?.options;
+    if (typeof options?.provider === 'string' && options.provider !== ''
+      && typeof options?.model === 'string' && options.model !== '') {
+      return { provider: options.provider, model: options.model };
+    }
+    const events = ctx.get('sessions')?.get?.(sessionId)?.snapshotEvents?.() ?? [];
+    // Newest `request/header` wins: that is the route the user is talking on.
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const data = events[index]?.data;
+      const provider = data?.provider ?? data?.model?.provider;
+      const model = data?.model?.model ?? data?.model;
+      if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
+        return { provider, model };
+      }
+    }
+  } catch { /* fall through to the harness default */ }
+  return undefined;
+}
+
+/** The harness's own default route (`agentDefaultModel`), when present. */
+function defaultRouteOf(ctx) {
+  try {
+    const service = ctx.get('agentDefaultModel');
+    const selection = service?.currentSelection?.();
+    const provider = selection?.provider ?? selection?.model?.provider;
+    const model = selection?.model?.model ?? selection?.model;
+    if (typeof provider === 'string' && provider !== '' && typeof model === 'string' && model !== '') {
+      return { provider, model };
+    }
+  } catch { /* no default route in this deployment */ }
+  return undefined;
+}
+
+/**
+ * Stage and commit an EXPLICIT file list in one root.
+ *
+ * This is the only write path in the plugin. The caller names the files, and
+ * the staging is `git add -- <paths>` (never `-A`): a background commit that
+ * silently swallowed an unrelated in-flight edit would be the worst thing this
+ * panel could do. `git commit -- <paths>` then commits exactly those paths, so
+ * anything already staged by someone else is left alone.
+ */
+async function handleCommitWrite(request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  const paths = Array.isArray(body.paths) ? body.paths.filter((p) => typeof p === 'string' && p !== '') : [];
+
+  if (root === '') { sendText(response, 400, 'root is required'); return; }
+  if (message === '') { sendText(response, 400, 'a commit message is required'); return; }
+  if (Buffer.byteLength(message, 'utf8') > MAX_COMMIT_MESSAGE_BYTES) {
+    sendText(response, 400, 'commit message is too long');
+    return;
+  }
+  if (paths.length === 0) { sendText(response, 400, 'no files to commit'); return; }
+
+  try {
+    await runGit(root, ['add', '--', ...paths], { maxBytes: 256 * 1024 });
+    // `--literal-pathspecs` keeps a file whose name looks like pathspec magic
+    // from being reinterpreted here.
+    const out = await runGit(root, ['--literal-pathspecs', 'commit', '-m', message, '--', ...paths], { maxBytes: 1024 * 1024 });
+    const head = (await runGit(root, ['rev-parse', '--short', 'HEAD'], { maxBytes: 16 * 1024 })).trim();
+    sendJson(response, 200, { ok: true, hash: head, output: out.trim() });
+  } catch (error) {
+    // Surface git's own words: "nothing to commit", a hook rejection and a
+    // missing identity are three different things the user must be able to tell
+    // apart.
+    sendText(response, error.status ?? 500, error.message || 'commit failed');
+  }
+}
+
+/**
  * Parse `git log` output written with a RECORD SEPARATOR framing.
  *
  * A commit subject can contain almost anything — including `|`, tabs and
@@ -744,6 +985,21 @@ async function handleDiff(request, response) {
   }
 }
 
+/** Draft a commit message for one root and hand it back. */
+async function handleSuggestMessage(ctx, request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  if (root === '') { sendText(response, 400, 'root is required'); return; }
+  const language = body.language === 'zh' ? 'zh' : 'en';
+  const focus = body.focus === 'staged' ? 'staged' : 'worktree';
+  try {
+    const draft = await draftCommitMessage(ctx, root, body.sessionId, language, focus);
+    sendJson(response, 200, draft);
+  } catch (error) {
+    sendText(response, error.status ?? 500, error.message || 'suggestion failed');
+  }
+}
+
 export function apply(ctx) {
   ctx.inject(['webServer'], (host) => {
     host.effect(() => {
@@ -774,6 +1030,20 @@ export function apply(ctx) {
           handler: (request, response) => {
             if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
             return handleCommit(request, response);
+          }
+        },
+        {
+          path: `${API}/commit-write`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleCommitWrite(request, response);
+          }
+        },
+        {
+          path: `${API}/suggest-message`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleSuggestMessage(host, request, response);
           }
         }
       ];
