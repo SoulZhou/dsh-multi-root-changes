@@ -316,13 +316,17 @@ window.__ModuleLoader__.load({
         }
         if (line.startsWith('+')) {
           rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineAdd' },
-            h('span', { className: 'mrc-lineNo' }, String(newNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+            h('span', { className: 'mrc-lineNo' }, String(newNo)),
+            h('span', { className: 'mrc-sign' }, '+'),
+            h('span', { className: 'mrc-lineText' }, line.slice(1))));
           newNo += 1;
           continue;
         }
         if (line.startsWith('-')) {
           rows.push(h('div', { key: rows.length, className: 'mrc-line mrc-lineDel' },
-            h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+            h('span', { className: 'mrc-lineNo' }, String(oldNo)),
+            h('span', { className: 'mrc-sign' }, '−'),
+            h('span', { className: 'mrc-lineText' }, line.slice(1))));
           oldNo += 1;
           continue;
         }
@@ -331,7 +335,9 @@ window.__ModuleLoader__.load({
           continue;
         }
         rows.push(h('div', { key: rows.length, className: 'mrc-line' },
-          h('span', { className: 'mrc-lineNo' }, String(oldNo)), h('span', { className: 'mrc-lineText' }, line.slice(1))));
+          h('span', { className: 'mrc-lineNo' }, String(oldNo)),
+          h('span', { className: 'mrc-sign' }, ' '),
+          h('span', { className: 'mrc-lineText' }, line.slice(1))));
         oldNo += 1;
         newNo += 1;
       }
@@ -378,7 +384,11 @@ window.__ModuleLoader__.load({
           data.truncated ? h('div', { className: 'mrc-diffNote' }, t('tooLarge')) : null,
           h('div', { className: 'mrc-diffHead' }, `${t('untracked')} · ${entry.path}`),
           lines.map((line, index) => h('div', { key: index, className: 'mrc-line mrc-lineAdd' },
-            h('span', { className: 'mrc-lineNo' }, String(index + 1)), h('span', { className: 'mrc-lineText' }, line))));
+            h('span', { className: 'mrc-lineNo' }, String(index + 1)),
+            // A whole new file is all additions, so every row carries the same
+            // `+` the diff rows do — the gutter lines up across both views.
+            h('span', { className: 'mrc-sign' }, '+'),
+            h('span', { className: 'mrc-lineText' }, line))));
       }
 
       const patch = String(data.patch ?? '');
@@ -895,10 +905,30 @@ window.__ModuleLoader__.load({
 .mrc-lineNo { color: var(--dsw-alias-label-tertiary); min-width: 34px; text-align: right; flex: none;
   user-select: none; }
 .mrc-lineText { white-space: pre; }
-.mrc-lineAdd { background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 12%, transparent); }
-.mrc-lineDel { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); }
+/* The +/- gutter keeps the markdown-copyable shape of a unified diff and gives
+   the eye a second, position-stable cue independent of colour. */
+.mrc-sign { flex: none; width: 8px; text-align: center; user-select: none; opacity: 1;
+  font-weight: 700; }
+/* Diff rows are marked THREE ways, because a tinted background alone is not
+   enough: at 12% the fill was invisible next to the surface, and the text itself
+   stayed the theme's label colour so nothing told the eye where a change began.
+
+   The text colour is MIXED WITH THE LABEL COLOUR rather than set to the raw
+   state colour: the state-success alias is a bright green chosen to sit on a
+   DARK surface, and painting it on its own 18% tint measured 1.96:1 — worse
+   than the plain row it replaced. Mixing 55% of the theme's primary label into
+   it keeps the hue recognisable while pulling the value toward the text colour
+   that is already known to be readable on this surface. */
+.mrc-lineAdd { background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 18%, transparent);
+  box-shadow: inset 3px 0 0 var(--dsw-alias-state-success-primary); }
+.mrc-lineAdd .mrc-lineText, .mrc-lineAdd .mrc-lineNo, .mrc-lineAdd .mrc-sign {
+  color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, var(--dsw-alias-label-primary)); }
+.mrc-lineDel { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 18%, transparent);
+  box-shadow: inset 3px 0 0 var(--dsw-alias-state-error-primary); }
+.mrc-lineDel .mrc-lineText, .mrc-lineDel .mrc-lineNo, .mrc-lineDel .mrc-sign {
+  color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, var(--dsw-alias-label-primary)); }
 .mrc-hunk { padding: 2px 8px; color: var(--dsw-alias-state-business-primary);
-  background: var(--dsw-alias-bg-layer-2); white-space: pre; }
+  background: var(--dsw-alias-bg-layer-2); white-space: pre; font-weight: 600; }
 .mrc-fileHead { padding: 1px 8px; color: var(--dsw-alias-label-tertiary); white-space: pre; }
 .mrc-diffNote { padding: 8px 12px; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
 .mrc-commits { border-top: 1px dashed var(--dsw-alias-border-l1); margin-top: 2px; }
