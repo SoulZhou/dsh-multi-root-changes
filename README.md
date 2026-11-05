@@ -1,0 +1,102 @@
+# dsh-multi-root-changes
+
+给 DeepSeek Harness 的侧栏加一个 **多根改动** 页签：一个面板里同时看到会话主工作目录
+**以及所有已登记的附加工作目录**的 Git 改动。
+
+![多根改动面板](screenshots/panel.png)
+
+## 它解决什么问题
+
+DSH 自带的「Git / 文件变动」面板按 **会话工作目录向下扫描** 来找仓库。但很多项目的实际结构是
+**若干个平级仓库**：
+
+```text
+F:\AsProject\
+  CanBusSDK\        ← 会话主目录（Git 仓库）
+  CanBus\           ← 同级（Git 仓库）
+  LibStrProject\    ← 同级（Git 仓库）
+```
+
+`CanBus`、`LibStrProject` 都不在 `CanBusSDK` 下面，所以自带面板永远扫描不到它们 ——
+哪怕你已经用 `@dsh-electron/dsh-plugin-multi-root-workspace` 把它们登记成了附加根，
+Agent 能读写它们，**但你仍然只能在面板里看到主仓库的改动**。
+
+本插件就是补上这一块：读取多根注册表，对主根与每个附加根各跑一次只读的 `git status`，
+在一个页签里分组展示。实测同一会话：
+
+| 目录 | 类型 | 改动文件 |
+| --- | --- | --- |
+| CanBusSDK | 主目录 | 4 |
+| CanBus | 附加目录 | 5 |
+| LibStrProject | 附加目录 | 35 |
+| **合计** | | **44** |
+
+## 功能
+
+- **按根分组**：主目录 + 每个附加目录各一节，显示目录名、分支、ahead/behind、增删行数、文件数。
+- **目录树折叠**：改动路径按 VS Code SCM 的方式折成目录树，单链目录压缩成一行（`a/b/c`）。
+- **行级 diff**：点任意文件读该文件的 unified diff（含 hunk 头与 +/- 行号）。
+- **重命名**：porcelain v2 的 `2` 记录带 `origPath`，显示为 `旧 → 新`，两侧路径都进 pathspec。
+- **新文件**：未跟踪文件按「全文新增」渲染；二进制（含 NUL 字节）显示为「二进制文件 · N KB」而不是乱码。
+- **冲突**：`u` 记录单独标红。
+- **不误判**：`rev-parse --show-toplevel` 与登记路径不一致时，标为「该目录属于另一个仓库」，
+  绝不把父仓库的改动算到这个目录头上。
+- **跟随会话**：主根由宿主按 `sessionId` 解析（不是客户端传来的陈旧 cwd），
+  切换会话/工作区时面板自动跟随。
+- **省电**：页签不可见时停止轮询（宿主会保留已访问页签的挂载，不门控就会一直空转）。
+
+## 安装
+
+```sh
+dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
+```
+
+或用 npm 包名 / 本地目录在**插件 → 添加插件**里安装。
+
+依赖（可选但强烈建议）：
+
+- `dsh-better-sidebar` —— 页签通过它的 `ctx.betterSidebar.registerTab` 注册，落在 DSH 自己的右侧栏里。
+- `@dsh-electron/dsh-plugin-multi-root-workspace` —— 附加根的来源；没装时本插件退化为只显示主目录。
+
+装完 **完全退出并重新打开 DeepSeek Harness**（只刷新页面不够：宿主半的路由需要重新加载）。
+
+## 用法
+
+右侧栏点 `+` → **多根改动**（或在页签条里切到它）。
+
+- 顶部是文件总数与刷新按钮。
+- 每个目录一节，点标题折叠/展开。
+- 点文件在底部打开 diff，`×` 关闭，`↻` 重读。
+- 不可见时自动停止轮询，8 秒一次（可见时）。
+
+## 访问级别与安全
+
+- **全程只读**：只执行 `status` / `rev-parse` / `diff`。不 stage、不 commit、不 checkout、不写任何文件。
+- 面板只展示"改了什么"，改动由你自己在 Git 或 Agent 侧处理。
+- 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state` 与 `/dsh-multi-root-changes/api/diff`。
+
+## 已知边界
+
+- 只读：没有暂存、提交、丢弃、切换分支等写操作。
+- 不做提交图、不做 stash/branch 操作 —— 那些用 better-sidebar 自带的 Git 页签。
+- 附加根里若登记的是**另一个仓库的子目录**，会被判为「属于另一个仓库」而不是独立仓库（有意的，避免把父仓库的改动记到子目录上）。
+- 单文件 diff 上限 2 MiB、未跟踪文件预览上限 1 MiB、单根条目上限 3000；超出会明确提示截断。
+- Windows 下经受限 token 启动的进程可能读不到某些路径，此时该目录会显示读取失败原因而不是静默消失。
+
+## 开发与验证
+
+```sh
+node --check index.js
+node --check client.js
+node tests/verify-parsers.mjs      # 解析器对真实三仓 + 合成记录的验证
+```
+
+`tests/verify-parsers.mjs` 会直接对真实仓库跑 `git status --porcelain=v2 --branch -z`，
+用一个**独立的 oracle 计数**交叉校验解析条目数，并覆盖重命名、冲突、CJK、空格路径等分支。
+
+GUI 验证脚本（`tests/cdp-*.mjs`）通过 CDP 驱动真实浏览器，断言三个目录都列出、
+各自文件数正确、附加根的文件 diff 能渲染、控制台零报错。
+
+## 许可证
+
+MIT
