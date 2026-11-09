@@ -13,6 +13,11 @@
  * sibling checkout never gets resolved against the wrong repository (which is
  * exactly what a cwd-pinned git route would do).
  *
+ * Every repo section carries a commit box (message + AI draft + Commit + Push).
+ * Both write actions refresh the whole state on success: commit so the new entry
+ * appears in that repo's history, and push so the ahead/behind counter and the
+ * commit-history list are re-read from git at their latest values.
+ *
  * Dependency-free by design: React comes from the shell, no bundler, no imports.
  */
 
@@ -69,6 +74,14 @@ window.__ModuleLoader__.load({
         commitPlaceholder: '提交信息（Ctrl+Enter 提交）',
         commitAction: '提交',
         committing: '提交中…',
+        commitTitle: '提交：把改动写成本地提交（存进本机仓库，不联网）',
+        pushAction: '推送',
+        pushing: '推送中…',
+        pushed: '已推送 {branch}',
+        pushTitle: '推送：把本地提交上传到远端仓库（需要网络）',
+        flowHint: '提交 = 存进本地仓库　·　推送 = 上传到远端仓库',
+        aheadTitle: '↑ {count} 个本地提交还没推送',
+        behindTitle: '↓ {count} 个远端提交还没拉取',
         aiGenerate: 'AI 生成',
         generating: '生成中…',
         committed: '已提交 {hash}'
@@ -103,6 +116,14 @@ window.__ModuleLoader__.load({
         commitPlaceholder: 'Commit message (Ctrl+Enter to commit)',
         commitAction: 'Commit',
         committing: 'Committing…',
+        commitTitle: 'Commit: write the changes as a local commit (stays on this machine, no network)',
+        pushAction: 'Push',
+        pushing: 'Pushing…',
+        pushed: 'Pushed {branch}',
+        pushTitle: 'Push: upload the local commits to the remote repository (needs network)',
+        flowHint: 'Commit = save locally · Push = upload to remote',
+        aheadTitle: '↑ {count} local commit(s) not pushed yet',
+        behindTitle: '↓ {count} remote commit(s) not fetched yet',
         aiGenerate: 'AI draft',
         generating: 'Drafting…',
         committed: 'Committed {hash}'
@@ -348,7 +369,7 @@ window.__ModuleLoader__.load({
 
     /** The diff reader: a unified patch, or a new file's whole content. */
     function DiffView(props) {
-      const { root, entry, t } = props;
+      const { root, entry, t, refreshTick } = props;
       const [state, setState] = useState({ loading: true, error: null, data: null });
 
       useEffect(() => {
@@ -366,7 +387,7 @@ window.__ModuleLoader__.load({
           if (live) setState({ loading: false, error: error.message, data: null });
         });
         return () => { live = false; };
-      }, [root, entry.path, entry.origPath, entry.x, entry.y, entry.untracked]);
+      }, [root, entry.path, entry.origPath, entry.x, entry.y, entry.untracked, refreshTick]);
 
       if (state.loading) return h('div', { className: 'mrc-diffNote' }, t('loading'));
       if (state.error !== null) return h('div', { className: 'mrc-diffNote mrc-error' }, `${t('diffFailed')}: ${state.error}`);
@@ -436,9 +457,18 @@ window.__ModuleLoader__.load({
 
     /** One root's collapsible commit history. */
     function CommitSection(props) {
-      const { root, t, selected, onSelectCommit, limit } = props;
+      const { root, t, selected, onSelectCommit, limit, refreshSignal, refreshTick } = props;
       const [open, setOpen] = useState(false);
       const [state, setState] = useState({ loading: false, error: null, commits: [], hasCommits: true });
+
+      // A commit or a successful push bumps refreshSignal in the tab. The history
+      // must re-read from git even when the parent passes a fresh `root` object,
+      // because the fetch effect only depends on the primitive root.path/limit.
+      // Auto-expanding on that signal makes the refreshed latest commits visible
+      // instead of hiding them behind a still-collapsed toggle.
+      useEffect(() => {
+        if (refreshSignal > 0) setOpen(true);
+      }, [refreshSignal]);
 
       useEffect(() => {
         if (!open) return undefined;
@@ -456,7 +486,7 @@ window.__ModuleLoader__.load({
           })
           .catch((error) => { if (live) setState({ loading: false, error: error.message, commits: [], hasCommits: false }); });
         return () => { live = false; };
-      }, [open, root.path, limit]);
+      }, [open, root.path, limit, refreshSignal, refreshTick]);
 
       return h('div', { className: 'mrc-commits' },
         h('button', {
@@ -490,14 +520,24 @@ window.__ModuleLoader__.load({
           : null);
     }
 
-    /** One root's collapsible commit box: message, AI draft, and the commit. */
+    /** One root's action box: message, AI draft, Commit and Push. */
     function CommitBox(props) {
-      const { root, t, onCommitted, sessionId } = props;
+      const { root, t, onCommitted, sessionId, refreshTick } = props;
       const [message, setMessage] = useState('');
       const [busy, setBusy] = useState(false);
       const [suggesting, setSuggesting] = useState(false);
+      const [pushing, setPushing] = useState(false);
       const [error, setError] = useState(null);
       const [notice, setNotice] = useState(null);
+
+      // A manual refresh means "show me the repo as it is now"; a stale failure
+      // or success notice from an earlier action no longer describes that state.
+      useEffect(() => {
+        if (refreshTick > 0) {
+          setError(null);
+          setNotice(null);
+        }
+      }, [refreshTick]);
 
       const entries = root.status?.entries ?? [];
       // The box commits the WORKING TREE set: every changed path the panel is
@@ -505,7 +545,7 @@ window.__ModuleLoader__.load({
       const paths = entries.map((entry) => entry.path);
 
       const suggest = async () => {
-        if (suggesting || busy || paths.length === 0) return;
+        if (suggesting || busy || pushing || paths.length === 0) return;
         setSuggesting(true);
         setError(null);
         setNotice(null);
@@ -525,7 +565,7 @@ window.__ModuleLoader__.load({
       };
 
       const commit = async () => {
-        if (busy || suggesting) return;
+        if (busy || suggesting || pushing) return;
         if (message.trim() === '' || paths.length === 0) return;
         setBusy(true);
         setError(null);
@@ -542,14 +582,42 @@ window.__ModuleLoader__.load({
         }
       };
 
+      // Push never commits and never needs a message: it sends whatever the
+      // current branch's upstream is tracking. On success the tab bumps its
+      // refresh counter, which re-reads /state (ahead/behind, branch) and makes
+      // the commit-history list re-fetch the latest log from git.
+      const push = async () => {
+        if (busy || suggesting || pushing) return;
+        setPushing(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const reply = await postJson('/push', { root: root.path });
+          let text = t('pushed', { branch: reply.branch ?? '' });
+          const output = (reply.output ?? '').trim();
+          if (output !== '' && !/everything up[- ]to[- ]date/i.test(output)) {
+            text += ` · ${output.split(/\r?\n/)[0].slice(0, 80)}`;
+          }
+          setNotice(text);
+          onCommitted?.();
+        } catch (failure) {
+          setError(String(failure.message || failure));
+        } finally {
+          setPushing(false);
+        }
+      };
+
+      const anyBusy = busy || suggesting || pushing;
+
       return h('div', { className: 'mrc-commitBox' },
+        h('div', { className: 'mrc-flowHint', title: t('flowHint') }, t('flowHint')),
         h('textarea', {
           className: 'mrc-commitInput',
           value: message,
           rows: 2,
           placeholder: t('commitPlaceholder'),
           spellCheck: false,
-          disabled: busy || suggesting,
+          disabled: anyBusy,
           onChange: (event) => setMessage(event.currentTarget.value),
           onKeyDown: (event) => {
             if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
@@ -562,15 +630,25 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'mrc-aiButton',
-            disabled: busy || suggesting || paths.length === 0,
+            disabled: anyBusy || paths.length === 0,
             title: t('aiGenerate'),
             onClick: () => { void suggest() }
           }, suggesting ? t('generating') : `✦ ${t('aiGenerate')}`),
           h('span', { className: 'mrc-commitCount' }, t('files', { count: paths.length })),
+          // Push does not commit and does not depend on the changed-path set,
+          // so the only gate is whether another write is already in flight.
+          h('button', {
+            type: 'button',
+            className: 'mrc-pushButton',
+            disabled: anyBusy,
+            title: t('pushTitle'),
+            onClick: () => { void push() }
+          }, pushing ? t('pushing') : t('pushAction')),
           h('button', {
             type: 'button',
             className: 'mrc-commitButton',
-            disabled: busy || suggesting || message.trim() === '' || paths.length === 0,
+            disabled: anyBusy || message.trim() === '' || paths.length === 0,
+            title: t('commitTitle'),
             onClick: () => { void commit() }
           }, busy ? t('committing') : t('commitAction'))),
         error !== null ? h('div', { className: 'mrc-note mrc-error' }, error) : null,
@@ -579,7 +657,7 @@ window.__ModuleLoader__.load({
 
     /** One root's collapsible section: header, counters, tree. */
     function RootSection(props) {
-      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId } = props;
+      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId, historyTick, refreshTick } = props;
       const status = root.status ?? {};
       const entries = Array.isArray(status.entries) ? status.entries : [];
       const [open, setOpen] = useState(true);
@@ -621,9 +699,18 @@ window.__ModuleLoader__.load({
           : null,
         hasRepo && status.detached === true ? h('span', { className: 'mrc-branch' }, t('detached')) : null,
         hasRepo && (status.ahead > 0 || status.behind > 0)
-          ? h('span', { className: 'mrc-aheadBehind' },
-            status.ahead > 0 ? `↑${status.ahead}` : '',
-            status.behind > 0 ? `↓${status.behind}` : '')
+          ? h('span', {
+            className: 'mrc-aheadBehind',
+            // The arrows are the least self-explanatory thing in the header:
+            // spell out which side each count belongs to, so "↑3" reads as
+            // "3 commits still to push" and not "3 commits downloaded".
+            title: [
+              status.ahead > 0 ? t('aheadTitle', { count: status.ahead }) : '',
+              status.behind > 0 ? t('behindTitle', { count: status.behind }) : ''
+            ].filter((line) => line !== '').join('\n')
+          },
+          status.ahead > 0 ? `↑${status.ahead}` : '',
+          status.behind > 0 ? `↓${status.behind}` : '')
           : null,
         hasRepo
           ? h('span', { className: 'mrc-rootCount', title: root.path },
@@ -642,8 +729,11 @@ window.__ModuleLoader__.load({
           hasRepo && entries.length === 0 ? h('div', { className: 'mrc-note' }, t('emptyRoot')) : null,
           hasRepo && status.truncated === true ? h('div', { className: 'mrc-note' }, t('truncated')) : null,
           hasRepo && tree.length > 0 ? h('div', { className: 'mrc-tree' }, tree.map((node, index) => renderNode(node, 0, `${root.path}:${index}`))) : null,
-          hasRepo && entries.length > 0
-            ? h(CommitBox, { root, t, sessionId, onCommitted })
+          // Every REPO gets the action box, not only repos with pending
+          // changes: after a clean commit (or on an already-clean repo) the
+          // user still needs the Push button to send that commit upstream.
+          hasRepo
+            ? h(CommitBox, { root, t, sessionId, onCommitted, refreshTick })
             : null,
           hasRepo
             ? h(CommitSection, {
@@ -651,7 +741,9 @@ window.__ModuleLoader__.load({
               t,
               limit: commitLimit,
               selected: selectedCommit,
-              onSelectCommit
+              onSelectCommit,
+              refreshSignal: historyTick,
+              refreshTick
             })
             : null)
           : null);
@@ -667,6 +759,17 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = useState(null);
       const [selectedCommit, setSelectedCommit] = useState(null);
       const [tick, setTick] = useState(0);
+      // Bumped on every successful commit AND push. `tick` re-reads /state;
+      // `historyTick` travels to each CommitSection, which re-fetches /log and
+      // expands itself so the freshly-pushed history is actually on screen.
+      const [historyTick, setHistoryTick] = useState(0);
+      // Bumped by both refresh buttons: the toolbar one re-reads the open diff
+      // along with /state, the preview one re-reads that diff alone.
+      const [diffTick, setDiffTick] = useState(0);
+      // Bumped ONLY by the toolbar refresh button. It re-reads each root's
+      // commit history and clears stale commit/push messages, so an external
+      // commit becomes visible without a commit action inside this panel.
+      const [manualTick, setManualTick] = useState(0);
       // A parked tab body polls nothing; the host keeps every visited tab body
       // mounted, so an ungated timer would run panels nobody can see.
       const onScreen = visible !== false;
@@ -719,7 +822,11 @@ window.__ModuleLoader__.load({
             className: 'mrc-iconButton',
             title: t('refresh'),
             'aria-label': t('refresh'),
-            onClick: () => setTick((value) => value + 1)
+            onClick: () => {
+              setTick((value) => value + 1);
+              setDiffTick((value) => value + 1);
+              setManualTick((value) => value + 1);
+            }
           }, '↻')),
 
         state.error !== null
@@ -746,7 +853,12 @@ window.__ModuleLoader__.load({
               onSelectCommit,
               commitLimit: COMMIT_LIMIT,
               sessionId,
-              onCommitted: () => setTick((value) => value + 1)
+              historyTick,
+              refreshTick: manualTick,
+              onCommitted: () => {
+                setTick((value) => value + 1);
+                setHistoryTick((value) => value + 1);
+              }
             })))),
 
           selected !== null
@@ -759,7 +871,7 @@ window.__ModuleLoader__.load({
                   className: 'mrc-iconButton',
                   title: t('refresh'),
                   'aria-label': t('refresh'),
-                  onClick: () => setSelected((prev) => (prev === null ? null : { ...prev }))
+                  onClick: () => setDiffTick((value) => value + 1)
                 }, '↻'),
                 h('button', {
                   type: 'button',
@@ -768,7 +880,7 @@ window.__ModuleLoader__.load({
                   'aria-label': 'Close',
                   onClick: () => setSelected(null)
                 }, '×')),
-              h(DiffView, { key: `${selected.root}:${selected.entry.path}`, root: selected.root, entry: selected.entry, t }))
+              h(DiffView, { key: `${selected.root}:${selected.entry.path}`, root: selected.root, entry: selected.entry, t, refreshTick: diffTick }))
             : null,
 
           selectedCommit !== null
@@ -866,7 +978,9 @@ window.__ModuleLoader__.load({
 .mrc-note { padding: 6px 12px; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
 .mrc-ok { color: var(--dsw-alias-state-success-primary); }
 /* The commit box sits between the file tree and the history: message first,
-   then the two actions (AI draft / commit) on one row so the panel stays dense. */
+   then the actions (AI draft / Push / Commit) on one row so the panel stays
+   dense. Commit is the brand-filled primary action; Push is a secondary
+   outline button so the two write actions read as different strengths. */
 .mrc-commitBox { border-top: 1px dashed var(--dsw-alias-border-l1); padding: 6px 8px; display: flex;
   flex-direction: column; gap: 4px; }
 .mrc-commitInput { width: 100%; box-sizing: border-box; resize: vertical; min-height: 34px;
@@ -875,6 +989,10 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--dsw-alias-border-l2); }
 .mrc-commitInput:focus { outline: none; border-color: var(--dsw-alias-state-business-primary); }
 .mrc-commitActions { display: flex; align-items: center; gap: 6px; }
+/* One line that names the difference between the two write actions, because
+   "提交" and "推送" read like synonyms to anyone who is not a git daily user:
+   commit saves locally, push uploads to the remote. */
+.mrc-flowHint { color: var(--dsw-alias-label-tertiary); font-size: 10px; line-height: 14px; }
 .mrc-commitCount { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
 .mrc-aiButton { margin-left: auto; border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px;
   background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
@@ -882,6 +1000,10 @@ window.__ModuleLoader__.load({
   font: inherit; font-size: 11px; padding: 2px 8px; }
 .mrc-aiButton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary); }
+.mrc-pushButton { border: 1px solid var(--dsw-alias-state-business-primary); border-radius: 4px;
+  background: transparent; color: var(--dsw-alias-state-business-primary); cursor: pointer;
+  font: inherit; font-size: 11px; padding: 2px 10px; font-weight: 600; }
+.mrc-pushButton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .mrc-commitButton { border: 0; border-radius: 4px; cursor: pointer; font: inherit; font-size: 11px;
   padding: 3px 10px; font-weight: 600;
   /* The label must not read its colour from a SURFACE alias: theme plugins
@@ -892,7 +1014,7 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-state-business-primary);
   color: #0b0f14; }
 .mrc-commitButton:hover:not(:disabled) { filter: brightness(1.08); }
-.mrc-aiButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
+.mrc-aiButton:disabled, .mrc-pushButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
 /* Left/right split while a file or commit is open, stacked while it is not.
    The panel is a narrow column, so a vertical split (tree above, diff below) ate

@@ -17,9 +17,11 @@
  * resolve a sibling root to the wrong repository).
  *
  * Reads (`status` / `rev-parse` / `log` / `show` / `diff`) never touch the
- * repository. The ONE write path is `/commit`, which stages the named files and
- * creates a commit — it is explicit, takes an explicit file list, and is the
- * only place this plugin runs `git add` or `git commit`.
+ * repository. There are two explicit write paths: `/commit-write` stages a named
+ * file list and creates a commit (the only `git add` / `git commit`), and
+ * `/push` sends the current branch to its remote (the only network write). Push
+ * never force-pushes, pulls, fetches or rewrites history; a first push records
+ * the upstream tracking branch so later pushes are one click.
  */
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
@@ -32,6 +34,8 @@ const API = '/dsh-multi-root-changes/api';
 const MAX_ENTRIES = 3000;
 /** One git invocation's budget. A stalled mount must not hold the panel. */
 const GIT_TIMEOUT_MS = 20_000;
+/** A network push gets a longer leash, but still cannot hang the panel forever. */
+const PUSH_TIMEOUT_MS = 120_000;
 /** `git status` stdout ceiling (untracked-heavy trees can be large). */
 const MAX_STATUS_BYTES = 8 * 1024 * 1024;
 /** `git diff` stdout ceiling. */
@@ -44,10 +48,34 @@ const MAX_ADDITIONAL_ROOTS = 64;
 const SUGGEST_DIFF_LIMIT = 12_000;
 /** Output budget of one commit-message draft. */
 const SUGGEST_MAX_TOKENS = 512;
+/**
+ * Ceiling for one draft when the route cannot be pinned to a cheap reasoning
+ * effort. `maxTokens` caps thinking AND visible text TOGETHER, so a model whose
+ * only advertised effort is `high` (WorkBuddy's `hy4free`, for one) can spend
+ * the entire 512-token budget deliberating and emit no text at all — surfacing
+ * as "chunks seen: block-start, reasoning-delta". A reasoning model needs room
+ * for both, so this budget applies only when such an effort was requested.
+ */
+const SUGGEST_MAX_TOKENS_REASONING = 4096;
 /** Hard deadline of one draft (a stalled provider must not hang the panel). */
 const SUGGEST_TIMEOUT_MS = 30_000;
+/**
+ * Deadline for a draft that has to reserve room for thinking. A reasoning
+ * route can legitimately spend far longer before the first TEXT token arrives,
+ * so keeping the 30-second deadline would convert the empty-message failure
+ * into a timeout instead of fixing it.
+ */
+const SUGGEST_TIMEOUT_MS_REASONING = 120_000;
 /** A commit message longer than this is almost certainly not a message. */
 const MAX_COMMIT_MESSAGE_BYTES = 8 * 1024;
+
+/**
+ * Canonical reasoning-effort ordering, cheapest first. Only used to pick the
+ * LOWEST effort a model advertises; ids outside this list cannot be ordered
+ * against known ones, so they never outrank them. `max` is included because
+ * some adapters (the WorkBuddy connector, for one) advertise it above `xhigh`.
+ */
+const REASONING_LEVEL_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 function dshHome() {
   return process.env.DSH_HOME && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh');
@@ -121,7 +149,7 @@ function baseName(path) {
  * different things to the reader.
  */
 function runGit(cwd, args, options = {}) {
-  const { timeoutMs = GIT_TIMEOUT_MS, maxBytes = MAX_STATUS_BYTES } = options;
+  const { timeoutMs = GIT_TIMEOUT_MS, maxBytes = MAX_STATUS_BYTES, env, captureStderr } = options;
   return new Promise((resolveRun, rejectRun) => {
     const child = execFile(
       'git',
@@ -131,18 +159,25 @@ function runGit(cwd, args, options = {}) {
         windowsHide: true,
         timeout: timeoutMs,
         maxBuffer: maxBytes,
-        encoding: 'buffer'
+        encoding: 'buffer',
+        // A push must never pop an interactive credential dialog: the panel has
+        // no terminal to answer it, so git must fail fast with a readable error.
+        ...(env !== undefined ? { env } : {})
       },
       (error, stdout, stderr) => {
+        const stderrText = stderr && stderr.length > 0 ? stderr.toString('utf8') : '';
         if (error) {
-          const detail = (stderr && stderr.length > 0 ? stderr.toString('utf8') : error.message).trim();
+          const detail = (stderrText !== '' ? stderrText : error.message).trim();
           const wrapped = new Error(detail || 'git failed');
           wrapped.gitArgs = args;
           wrapped.code = error.code;
           rejectRun(wrapped);
           return;
         }
-        resolveRun(stdout.toString('utf8'));
+        const stdoutText = stdout.toString('utf8');
+        // `git push` writes its progress/reference lines to STDERR, not stdout.
+        // Only the push route opts in, so every other caller keeps its string.
+        resolveRun(captureStderr === true ? { stdout: stdoutText, stderr: stderrText } : stdoutText);
       }
     );
     child.on('error', rejectRun);
@@ -571,6 +606,50 @@ async function resolveRevision(root, hash) {
 }
 
 /**
+ * The cheapest reasoning effort a model advertises, or undefined when it
+ * advertises none (passing an effort to a non-reasoning model is rejected).
+ *
+ * An unknown effort id never outranks a known one; when every id is unknown
+ * the adapter's own first entry wins, since its declared order is the only
+ * signal available.
+ */
+function lowestReasoningEffortOf(efforts) {
+  if (!Array.isArray(efforts)) return undefined;
+  const ids = [];
+  for (const entry of efforts) {
+    const id = entry !== null && typeof entry === 'object' ? entry.id : undefined;
+    if (typeof id === 'string' && id !== '') ids.push(id);
+  }
+  let best;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const id of ids) {
+    const rank = REASONING_LEVEL_ORDER.indexOf(id);
+    if (rank < 0) continue;
+    if (rank < bestRank) {
+      best = id;
+      bestRank = rank;
+    }
+  }
+  return best ?? ids[0];
+}
+
+/**
+ * The reasoning effort to request for one route: the LOWEST the model
+ * advertises, or undefined when it advertises none.
+ *
+ * A one-line commit message needs no deliberation, while a high default (the
+ * DeepSeek adapter defaults to `high` unless the connection says otherwise)
+ * both delays the answer and can spend the whole output budget on thinking,
+ * returning reasoning chunks and NO text at all — reported as
+ * "the model returned no text (chunks seen: block-start, reasoning-delta…)".
+ */
+async function draftReasoningEffort(llm, route) {
+  if (typeof llm.resolveModelInfo !== 'function') return undefined;
+  const info = await Promise.resolve(llm.resolveModelInfo(route.provider, route.model)).catch(() => undefined);
+  return lowestReasoningEffortOf(info?.reasoning?.efforts);
+}
+
+/**
  * Draft a commit message from the staged/unstaged changes of ONE root.
  *
  * The model route is resolved the same way the harness resolves it for a
@@ -628,15 +707,25 @@ async function draftCommitMessage(ctx, root, sessionId, language, focus) {
   const pieces = [];
   const shapes = [];
   let failureReason;
+  const reasoningEffort = await draftReasoningEffort(llm, route);
+  // A route we could pin to a cheap effort needs the usual small budget. A
+  // route that keeps thinking regardless (or one we could not interrogate)
+  // gets the larger one, because thinking is billed against `maxTokens` too.
+  const reserveForThinking = reasoningEffort !== undefined && reasoningEffort !== 'off';
+  const maxTokens = reserveForThinking ? SUGGEST_MAX_TOKENS_REASONING : SUGGEST_MAX_TOKENS;
+  const timeoutMs = reserveForThinking ? SUGGEST_TIMEOUT_MS_REASONING : SUGGEST_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('timeout')), SUGGEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
   try {
     for await (const chunk of llm.stream({
       provider: route.provider,
       model: route.model,
       messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
       system,
-      maxTokens: SUGGEST_MAX_TOKENS,
+      maxTokens,
+      // Omitted entirely when the model advertises no efforts: the harness
+      // rejects an effort on a non-reasoning model.
+      ...reasoningEffort === undefined ? {} : { reasoningEffort },
       signal: controller.signal
     })) {
       // A `finish` chunk carries the provider's verdict. A failed one (no API
@@ -655,7 +744,7 @@ async function draftCommitMessage(ctx, root, sessionId, language, focus) {
     }
   } catch (error) {
     if (error?.name === 'AbortError' || controller.signal.aborted) {
-      const timeout = new Error(`the model did not answer within ${Math.round(SUGGEST_TIMEOUT_MS / 1000)}s`);
+      const timeout = new Error(`the model did not answer within ${Math.round(timeoutMs / 1000)}s`);
       timeout.status = 504;
       throw timeout;
     }
@@ -743,11 +832,10 @@ function defaultRouteOf(ctx) {
 /**
  * Stage and commit an EXPLICIT file list in one root.
  *
- * This is the only write path in the plugin. The caller names the files, and
- * the staging is `git add -- <paths>` (never `-A`): a background commit that
- * silently swallowed an unrelated in-flight edit would be the worst thing this
- * panel could do. `git commit -- <paths>` then commits exactly those paths, so
- * anything already staged by someone else is left alone.
+ * Caller names the files, and the staging is `git add -- <paths>` (never `-A`):
+ * a background commit that silently swallowed an unrelated in-flight edit would
+ * be the worst thing this panel could do. `git commit -- <paths>` then commits
+ * exactly those paths, so anything already staged by someone else is left alone.
  */
 async function handleCommitWrite(request, response) {
   const body = await readJsonBody(request);
@@ -775,6 +863,94 @@ async function handleCommitWrite(request, response) {
     // missing identity are three different things the user must be able to tell
     // apart.
     sendText(response, error.status ?? 500, error.message || 'commit failed');
+  }
+}
+
+/**
+ * Push ONE root's current branch to its remote.
+ *
+ * The button is a one-click "send this repo's commits upstream", not a git
+ * workbench. To keep that promise safe and predictable:
+ *
+ *   - `push.default=upstream` + no refspec: an existing tracking branch decides
+ *     exactly where commits go, and a branch with NO upstream is refused with an
+ *     "upstream not set" error instead of guessing (the default `simple` would
+ *     also refuse, but `current` would silently create a remote branch).
+ *   - `-c push.autoSetupRemote=true` on a first push: when git >= 2.37 has a
+ *     single remote, this records the upstream so the NEXT click is a plain
+ *     `git push`. It never overrides an existing upstream. Older git silently
+ *     ignores the key, so a "no upstream" failure falls back ONCE to an
+ *     explicit `push --set-upstream <only-remote> <branch>` (see below).
+ *   - `GIT_TERMINAL_PROMPT=0` + `GCM_INTERACTIVE=never`: a missing credential
+ *     fails fast with git's own readable message instead of hanging the panel
+ *     on an invisible terminal/graphical login prompt.
+ *   - No `--force`, no `--all`, no `--tags`, no pull/fetch: the panel never
+ *     rewrites remote history and never moves local refs. A non-fast-forward
+ *     rejection is surfaced verbatim for the user to resolve.
+ *
+ * Root is re-validated as a real work tree (and not a subfolder of some other
+ * repo) so a stale row in the registry cannot push a different repository.
+ */
+async function handlePush(request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  if (root === '') { sendText(response, 400, 'root is required'); return; }
+
+  try {
+    const repo = await inspectRepo(root);
+    if (repo.isRepo !== true) {
+      sendText(response, 400, repo.nestedIn !== undefined
+        ? `this folder belongs to another repository: ${repo.nestedIn}`
+        : (repo.error ?? 'not a git repository'));
+      return;
+    }
+
+    // `symbolic-ref` fails on a detached HEAD. A detached commit has no branch
+    // to push, so say so instead of letting `git push` emit a cryptic error.
+    const branch = (await runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { maxBytes: 16 * 1024 })
+      .catch(() => '')).trim();
+    if (branch === '') {
+      sendText(response, 400, 'detached HEAD: there is no branch to push');
+      return;
+    }
+
+    // `git push` writes its progress/reference lines to STDERR, not stdout;
+    // capture both so the notice can include git's own "-> origin/main" line.
+    const pushEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
+    const pushOpts = { timeoutMs: PUSH_TIMEOUT_MS, maxBytes: 256 * 1024, env: pushEnv, captureStderr: true };
+    let result;
+    try {
+      result = await runGit(root, [
+        '-c', 'push.default=upstream',
+        '-c', 'push.autoSetupRemote=true',
+        'push'
+      ], pushOpts);
+    } catch (firstError) {
+      // git < 2.37 ignores the unknown `push.autoSetupRemote` key, so a branch
+      // with NO upstream fails here instead of setting one. Retry ONCE with the
+      // classic explicit `--set-upstream`, but only when there is exactly ONE
+      // remote (we refuse to guess which remote owns the branch) and both the
+      // remote and branch names are plain, safe tokens.
+      const message = String(firstError.message || '');
+      if (!/no upstream branch|has no upstream/i.test(message)) throw firstError;
+      const remotes = (await runGit(root, ['remote'], { maxBytes: 16 * 1024 }))
+        .trim().split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '');
+      if (remotes.length !== 1) throw firstError;
+      const remote = remotes[0];
+      const safeName = /^[A-Za-z0-9._\/-]+$/;
+      if (!safeName.test(remote) || !safeName.test(branch)) throw firstError;
+      result = await runGit(root, [
+        '-c', 'push.default=current',
+        'push', '--set-upstream', remote, branch
+      ], pushOpts);
+    }
+
+    const output = `${result.stdout}${result.stderr}`.trim();
+    sendJson(response, 200, { ok: true, branch, output });
+  } catch (error) {
+    // Surface git's own words verbatim: a non-fast-forward, an auth failure, a
+    // missing remote and a hook rejection are four different things to fix.
+    sendText(response, error.status ?? 500, error.message || 'push failed');
   }
 }
 
@@ -1040,6 +1216,13 @@ export function apply(ctx) {
           }
         },
         {
+          path: `${API}/push`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handlePush(request, response);
+          }
+        },
+        {
           path: `${API}/suggest-message`,
           handler: (request, response) => {
             if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
@@ -1067,4 +1250,4 @@ export function apply(ctx) {
   });
 }
 
-export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog };
+export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog, handlePush };
