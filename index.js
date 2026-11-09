@@ -24,7 +24,7 @@
  * the upstream tracking branch so later pushes are one click.
  */
 import { execFile } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -132,6 +132,41 @@ async function readJsonBody(request, limit = 256 * 1024) {
 function pathIdentity(path) {
   const absolute = resolve(path).replace(/[\\/]+$/, '');
   return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+}
+
+/**
+ * Resolve the `root` field of a write request into a real git work tree.
+ *
+ * A stale row in the registry (the folder was moved, renamed or deleted) must
+ * produce a message the reader can act on. Spawning git in a missing directory
+ * fails with the raw `spawn git ENOENT`, which says nothing about WHICH root
+ * vanished — so the existence check comes first and names the path.
+ *
+ * Returns `{ ok: true, root }` or `{ ok: false, status, message }`.
+ */
+async function resolveWritableRoot(body) {
+  const raw = typeof body.root === 'string' && body.root !== '' ? body.root : '';
+  if (raw === '') return { ok: false, status: 400, message: 'root is required' };
+  const root = resolve(raw);
+  try {
+    const info = await stat(root);
+    if (!info.isDirectory()) {
+      return { ok: false, status: 400, message: `not a folder: ${root}` };
+    }
+  } catch {
+    return { ok: false, status: 400, message: `folder does not exist: ${root}` };
+  }
+  const repo = await inspectRepo(root);
+  if (repo.isRepo !== true) {
+    return {
+      ok: false,
+      status: 400,
+      message: repo.nestedIn !== undefined
+        ? `this folder belongs to another repository: ${repo.nestedIn}`
+        : (repo.error ?? 'not a git repository')
+    };
+  }
+  return { ok: true, root };
 }
 
 /** The last path segment of either separator style. */
@@ -839,17 +874,24 @@ function defaultRouteOf(ctx) {
  */
 async function handleCommitWrite(request, response) {
   const body = await readJsonBody(request);
-  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
   const message = typeof body.message === 'string' ? body.message.trim() : '';
   const paths = Array.isArray(body.paths) ? body.paths.filter((p) => typeof p === 'string' && p !== '') : [];
 
-  if (root === '') { sendText(response, 400, 'root is required'); return; }
   if (message === '') { sendText(response, 400, 'a commit message is required'); return; }
   if (Buffer.byteLength(message, 'utf8') > MAX_COMMIT_MESSAGE_BYTES) {
     sendText(response, 400, 'commit message is too long');
     return;
   }
   if (paths.length === 0) { sendText(response, 400, 'no files to commit'); return; }
+
+  // The root is checked AFTER the message and the file list: a stale registry
+  // row must not be reported as "the commit message is empty".
+  const target = await resolveWritableRoot(body);
+  if (target.ok !== true) {
+    sendText(response, target.status, target.message);
+    return;
+  }
+  const root = target.root;
 
   try {
     await runGit(root, ['add', '--', ...paths], { maxBytes: 256 * 1024 });
@@ -893,18 +935,14 @@ async function handleCommitWrite(request, response) {
  */
 async function handlePush(request, response) {
   const body = await readJsonBody(request);
-  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
-  if (root === '') { sendText(response, 400, 'root is required'); return; }
+  const target = await resolveWritableRoot(body);
+  if (target.ok !== true) {
+    sendText(response, target.status, target.message);
+    return;
+  }
+  const root = target.root;
 
   try {
-    const repo = await inspectRepo(root);
-    if (repo.isRepo !== true) {
-      sendText(response, 400, repo.nestedIn !== undefined
-        ? `this folder belongs to another repository: ${repo.nestedIn}`
-        : (repo.error ?? 'not a git repository'));
-      return;
-    }
-
     // `symbolic-ref` fails on a detached HEAD. A detached commit has no branch
     // to push, so say so instead of letting `git push` emit a cryptic error.
     const branch = (await runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { maxBytes: 16 * 1024 })

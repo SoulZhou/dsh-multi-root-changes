@@ -221,6 +221,19 @@ console.log('\n=== 3. REAL git: handlePush end-to-end ===');
       const nr = await callPush({ root: notRepo });
       check('non-repository root -> 400', nr.status === 400, `status=${nr.status} body=${nr.text}`);
 
+      // A root whose folder was deleted must say WHICH path is gone, not leak
+      // the raw `spawn git ENOENT` from the failed child process.
+      const vanished = join(tmp, 'vanished-repo');
+      mkdirSync(vanished);
+      rmSync(vanished, { recursive: true, force: true });
+      const gone = await callPush({ root: vanished });
+      check('missing folder -> 400 naming the path',
+        gone.status === 400 && /does not exist/i.test(gone.text) && gone.text.includes(vanished),
+        `status=${gone.status} body=${gone.text}`);
+      check('missing folder does NOT leak "spawn git ENOENT"',
+        !/spawn git ENOENT/.test(gone.text),
+        `body=${gone.text}`);
+
       git(work, ['checkout', '--detach', 'HEAD']);
       const detached = await callPush({ root: work });
       check('detached HEAD -> 400 with a readable message',
