@@ -85,7 +85,12 @@ window.__ModuleLoader__.load({
         behindTitle: '↓ {count} 个远端提交还没拉取',
         aiGenerate: 'AI 生成',
         generating: '生成中…',
-        committed: '已提交 {hash}'
+        committed: '已提交 {hash}',
+        allRoots: '所有项目',
+        repoPickerTitle: '选择要显示和操作的仓库',
+        quickPushTitle: '推送：把选中仓库的本地提交上传到远端（需要网络）',
+        quickCommitTitle: '提交：把选中仓库的全部改动写成本地提交；提交信息自动生成',
+        suggestEmpty: 'AI 未能生成提交信息，请在下方输入框手写后提交'
       },
       en: {
         tab: 'Multi-root changes',
@@ -128,7 +133,12 @@ window.__ModuleLoader__.load({
         behindTitle: '↓ {count} remote commit(s) not fetched yet',
         aiGenerate: 'AI draft',
         generating: 'Drafting…',
-        committed: 'Committed {hash}'
+        committed: 'Committed {hash}',
+        allRoots: 'All projects',
+        repoPickerTitle: 'Choose which repository to show and act on',
+        quickPushTitle: 'Push: upload the local commits of the selected repository to the remote (needs network)',
+        quickCommitTitle: 'Commit: write all changes of the selected repository as a local commit; the message is drafted automatically',
+        suggestEmpty: 'AI could not draft a message; type one in the box below and commit'
       }
     };
 
@@ -757,6 +767,108 @@ window.__ModuleLoader__.load({
           : null);
     }
 
+    /**
+     * The quick bar above the root list: a repository picker plus one-click
+     * Push and Commit that act on the SELECTED repository.
+     *
+     * The picker is the compact way to reach any of the registered roots —
+     * "所有项目" shows every root's accordion as before, while a concrete
+     * choice collapses the view down to that one repository. The two buttons
+     * reuse the same endpoints as each repo's action box, so the safety rules
+     * (explicit paths, no force flags, up-to-date honesty) stay identical.
+     */
+    function QuickBar(props) {
+      const { roots, t, onCommitted, sessionId, pickedRoot, onPickedRoot } = props;
+      const picked = pickedRoot;
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState(null);
+      const [notice, setNotice] = useState(null);
+
+      const repos = roots.filter((root) => root.status?.isRepo === true);
+      const current = repos.find((root) => root.path === picked) ?? null;
+      const entries = current?.status?.entries ?? [];
+      const paths = entries.map((entry) => entry.path);
+
+      const run = async (action) => {
+        if (busy || current === null) return;
+        setBusy(true);
+        setError(null);
+        setNotice(null);
+        try {
+          if (action === 'push') {
+            const reply = await postJson('/push', { root: current.path });
+            const output = (reply.output ?? '').trim();
+            if (/everything up[- ]to[- ]date/i.test(output)) {
+              setNotice(t('pushUpToDate'));
+            } else {
+              setNotice(t('pushed', { branch: reply.branch ?? '' }));
+            }
+          } else {
+            // The quick bar has no message input: draft one from the changes
+            // first, then commit the SAME explicit path list the action box
+            // would have committed. Nothing is committed without a message.
+            let message = '';
+            try {
+              const draft = await postJson('/suggest-message', {
+                root: current.path,
+                sessionId,
+                language: isZh() ? 'zh' : 'en',
+                focus: 'worktree'
+              });
+              message = (draft.message ?? '').trim();
+            } catch {
+              // A failed draft must not block a manual flow: fall through with
+              // an empty message and tell the user what happened.
+            }
+            if (message === '') {
+              setError(t('suggestEmpty'));
+              return;
+            }
+            const reply = await postJson('/commit-write', { root: current.path, message, paths });
+            setNotice(t('committed', { hash: reply.hash ?? '' }));
+          }
+          onCommitted?.();
+        } catch (failure) {
+          setError(String(failure.message || failure));
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      if (repos.length === 0) return null;
+
+      return h('div', { className: 'mrc-quickBar' },
+        h('select', {
+          className: 'mrc-repoPicker',
+          title: t('repoPickerTitle'),
+          'aria-label': t('repoPickerTitle'),
+          value: picked,
+          onChange: (event) => {
+            onPickedRoot(event.currentTarget.value);
+            setError(null);
+            setNotice(null);
+          }
+        },
+        h('option', { value: '' }, t('allRoots')),
+        repos.map((repo) => h('option', { key: repo.path, value: repo.path }, repo.label))),
+        h('button', {
+          type: 'button',
+          className: 'mrc-pushButton',
+          disabled: busy || current === null,
+          title: t('quickPushTitle'),
+          onClick: () => { void run('push') }
+        }, busy && current !== null ? t('pushing') : t('pushAction')),
+        h('button', {
+          type: 'button',
+          className: 'mrc-commitButton',
+          disabled: busy || current === null || paths.length === 0,
+          title: t('quickCommitTitle'),
+          onClick: () => { void run('commit') }
+        }, t('commitAction')),
+        error !== null ? h('span', { className: 'mrc-note mrc-error mrc-quickMsg' }, error) : null,
+        notice !== null ? h('span', { className: 'mrc-note mrc-ok mrc-quickMsg' }, notice) : null);
+    }
+
     /** The tab's page body. */
     function MultiRootChangesTab(props) {
       const { scope, visible } = props;
@@ -781,6 +893,9 @@ window.__ModuleLoader__.load({
       // A parked tab body polls nothing; the host keeps every visited tab body
       // mounted, so an ungated timer would run panels nobody can see.
       const onScreen = visible !== false;
+      // The quick bar's repository picker: '' means every root (the original
+      // accordion view); a concrete path collapses the list to that one root.
+      const [pickedRoot, setPickedRoot] = useState('');
 
       useEffect(() => {
         if (!onScreen || sessionId === undefined) return undefined;
@@ -815,6 +930,7 @@ window.__ModuleLoader__.load({
 
       const roots = state.data?.roots ?? [];
       const totalFiles = roots.reduce((sum, root) => sum + (root.status?.entries?.length ?? 0), 0);
+      const visibleRoots = pickedRoot === '' ? roots : roots.filter((root) => root.path === pickedRoot);
 
       return h('div', {
         className: 'mrc-panel',
@@ -836,6 +952,17 @@ window.__ModuleLoader__.load({
               setManualTick((value) => value + 1);
             }
           }, '↻')),
+          h(QuickBar, {
+            roots,
+            t,
+            sessionId,
+            pickedRoot,
+            onPickedRoot: setPickedRoot,
+            onCommitted: () => {
+              setTick((value) => value + 1);
+              setHistoryTick((value) => value + 1);
+            }
+          }),
 
         state.error !== null
           ? h('div', { className: 'mrc-note mrc-error' }, `${t('readFailed')}: ${state.error}`)
@@ -851,7 +978,7 @@ window.__ModuleLoader__.load({
         // One row: the root list and the preview side by side (see .mrc-body).
         h('div', { className: 'mrc-body' },
           h('div', { className: 'mrc-rootsWrap' },
-            h('div', { className: 'mrc-roots' }, roots.map((root) => h(RootSection, {
+            h('div', { className: 'mrc-roots' }, visibleRoots.map((root) => h(RootSection, {
               key: root.path,
               root,
               t,
@@ -1023,6 +1150,18 @@ window.__ModuleLoader__.load({
   color: #0b0f14; }
 .mrc-commitButton:hover:not(:disabled) { filter: brightness(1.08); }
 .mrc-aiButton:disabled, .mrc-pushButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
+/* The quick bar: a repository picker plus one-click Push/Commit for the
+   selected repository, so the common "pick a repo, ship it" flow does not
+   require expanding each root's accordion to find its action box. */
+.mrc-quickBar { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1); flex-wrap: wrap; }
+.mrc-repoPicker { flex: 1; min-width: 0; max-width: 260px; font: inherit; font-size: 11px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18));
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px; padding: 2px 6px; }
+.mrc-repoPicker:focus { outline: 1px solid var(--dsw-alias-state-business-primary); }
+.mrc-quickMsg { font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 40%; }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
 /* Left/right split while a file or commit is open, stacked while it is not.
    The panel is a narrow column, so a vertical split (tree above, diff below) ate
