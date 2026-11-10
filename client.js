@@ -78,6 +78,7 @@ window.__ModuleLoader__.load({
         pushAction: '推送',
         pushing: '推送中…',
         pushed: '已推送 {branch}',
+        pushUpToDate: '远端已是最新：没有需要推送的本地提交（未提交的改动不会随推送上传）',
         pushTitle: '推送：把本地提交上传到远端仓库（需要网络）',
         flowHint: '提交 = 存进本地仓库　·　推送 = 上传到远端仓库',
         aheadTitle: '↑ {count} 个本地提交还没推送',
@@ -120,6 +121,7 @@ window.__ModuleLoader__.load({
         pushAction: 'Push',
         pushing: 'Pushing…',
         pushed: 'Pushed {branch}',
+        pushUpToDate: 'Remote is already up to date: nothing to push (uncommitted changes are NOT uploaded by push)',
         pushTitle: 'Push: upload the local commits to the remote repository (needs network)',
         flowHint: 'Commit = save locally · Push = upload to remote',
         aheadTitle: '↑ {count} local commit(s) not pushed yet',
@@ -593,10 +595,16 @@ window.__ModuleLoader__.load({
         setNotice(null);
         try {
           const reply = await postJson('/push', { root: root.path });
-          let text = t('pushed', { branch: reply.branch ?? '' });
           const output = (reply.output ?? '').trim();
-          if (output !== '' && !/everything up[- ]to[- ]date/i.test(output)) {
-            text += ` · ${output.split(/\r?\n/)[0].slice(0, 80)}`;
+          // "Everything up-to-date" is not a transfer: nothing new reached the remote.
+          if (/everything up[- ]to[- ]date/i.test(output)) {
+            setNotice(t('pushUpToDate'));
+            onCommitted?.();
+            return;
+          }
+          let text = t('pushed', { branch: reply.branch ?? '' });
+          if (output !== '') {
+            text += ` · ${output.split(/\r?\n/).filter((line) => line.trim() !== '').slice(-1)[0]?.slice(0, 80)}`;
           }
           setNotice(text);
           onCommitted?.();
