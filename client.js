@@ -308,12 +308,12 @@ window.__ModuleLoader__.load({
         ? h('button', {
           type: 'button',
           role: 'checkbox',
-          'aria-checked': checked === true,
-          className: checked === true ? 'mrc-check mrc-checkOn' : 'mrc-check',
-          title: checked === true ? t('uncheckFile') : t('checkFile'),
-          'aria-label': `${checked === true ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
-          onClick: (event) => { event.stopPropagation(); onToggle(entry.path); }
-        }, checked === true ? '✓' : '')
+          'aria-checked': checked !== true,
+          className: checked !== true ? 'mrc-check mrc-checkOn' : 'mrc-check',
+          title: checked !== true ? t('uncheckFile') : t('checkFile'),
+          'aria-label': `${checked !== true ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
+          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, checked !== true); }
+        }, checked !== true ? '✓' : '')
         : null,
       h('button', {
         type: 'button',
@@ -657,6 +657,41 @@ window.__ModuleLoader__.load({
 
       const anyBusy = busy || suggesting || pushing;
 
+      // Commit+push: the quick bar's one-click flow for the per-repo box too —
+      // the message the user typed becomes the commit, then that commit is
+      // pushed. "Everything up-to-date" right after a commit is a remote-side
+      // quirk, so the notice states the commit landed and nothing transferred.
+      // A failed push after a landed commit must SAY the commit landed,
+      // otherwise the user would re-commit and duplicate it.
+      const commitPush = async () => {
+        if (anyBusy) return;
+        if (message.trim() === '' || paths.length === 0) return;
+        setBusy(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const reply = await postJson('/commit-write', { root: root.path, message, paths });
+          setMessage('');
+          try {
+            const pushed = await postJson('/push', { root: root.path });
+            const output = (pushed.output ?? '').trim();
+            if (/everything up[- ]to[- ]date/i.test(output)) {
+              setNotice(`${t('committed', { hash: reply.hash ?? '' })} · ${t('pushUpToDate')}`);
+            } else {
+              setNotice(t('committedAndPushed', { hash: reply.hash ?? '', branch: pushed.branch ?? '' }));
+            }
+          } catch (pushFailure) {
+            setNotice(t('committed', { hash: reply.hash ?? '' }));
+            setError(String(pushFailure.message || pushFailure));
+          }
+          onCommitted?.();
+        } catch (failure) {
+          setError(String(failure.message || failure));
+        } finally {
+          setBusy(false);
+        }
+      };
+
       return h('div', { className: 'mrc-commitBox' },
         h('div', { className: 'mrc-flowHint', title: t('flowHint') }, t('flowHint')),
         h('textarea', {
@@ -698,14 +733,21 @@ window.__ModuleLoader__.load({
             disabled: anyBusy || message.trim() === '' || paths.length === 0,
             title: t('commitTitle'),
             onClick: () => { void commit() }
-          }, busy ? t('committing') : t('commitAction'))),
+          }, busy ? t('committing') : t('commitAction')),
+          h('button', {
+            type: 'button',
+            className: 'mrc-commitButton mrc-commitPushButton',
+            disabled: anyBusy || message.trim() === '' || paths.length === 0,
+            title: t('quickCommitPushTitle'),
+            onClick: () => { void commitPush() }
+          }, busy ? t('commitPushBusy') : t('commitPushAction'))),
         error !== null ? h('div', { className: 'mrc-note mrc-error' }, error) : null,
         notice !== null ? h('div', { className: 'mrc-note mrc-ok' }, notice) : null);
     }
 
     /** One root's collapsible section: header, counters, tree. */
     function RootSection(props) {
-      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId, historyTick, refreshTick, checkedPaths, onTogglePath } = props;
+      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId, historyTick, refreshTick, uncheckedPaths, onTogglePath } = props;
       const status = root.status ?? {};
       const entries = Array.isArray(status.entries) ? status.entries : [];
       const [open, setOpen] = useState(true);
@@ -727,11 +769,11 @@ window.__ModuleLoader__.load({
           depth,
           t,
           selected: isSelected,
-          checked: checkedPaths?.has(node.path) === true,
+          checked: uncheckedPaths?.has(node.path) === true,
           onToggle: onTogglePath,
           onSelect: (entry) => onSelectEntry(root.path, entry)
         });
-      }, [root.path, changed, selected, onSelectEntry, checkedPaths, onTogglePath, t]);
+      }, [root.path, changed, selected, onSelectEntry, uncheckedPaths, onTogglePath, t]);
 
       return h('section', { className: 'mrc-root' },
         h('button', {
@@ -828,7 +870,7 @@ window.__ModuleLoader__.load({
       // appear after a refresh join the checked set automatically.
       const commitPaths = current === null
         ? paths
-        : paths.filter((path) => checkedPaths?.has(path) !== false);
+        : paths.filter((path) => checkedPaths?.has(path) === true);
       const checkedCount = current === null ? paths.length : commitPaths.length;
 
       const draftMessage = async (root) => {
@@ -1043,9 +1085,9 @@ window.__ModuleLoader__.load({
       // by `${repoPath}\n${file}` and remembered per repository. Unlisted
       // paths default to CHECKED, so nothing changes until the user opts a
       // file out; the quick bar commits only the still-checked files.
-      const [checkedPaths, setCheckedPaths] = useState(() => new Set());
+      const [uncheckedPaths, setUncheckedPaths] = useState(() => new Set());
       const togglePath = useCallback((rootPath, filePath, checked) => {
-        setCheckedPaths((prev) => {
+        setUncheckedPaths((prev) => {
           const key = `${rootPath}\n${filePath}`;
           const next = new Set(prev);
           if (checked === true) next.delete(key);
@@ -1057,6 +1099,17 @@ window.__ModuleLoader__.load({
       // picker (all projects vs the chosen repository), so the toolbar row
       // keeps only the title.
       const visibleRoots = pickedRoot === '' ? roots : roots.filter((root) => root.path === pickedRoot);
+      // QuickBar consumes a SET of CHECKED paths of the picked repo (its own
+      // default-checked semantics); project it from the unchecked-key set.
+      const pickedChecked = (() => {
+        const set = new Set();
+        if (pickedRoot !== '') {
+          for (const entry of (state.data?.roots ?? []).find((root) => root.path === pickedRoot)?.status?.entries ?? []) {
+            if (uncheckedPaths.has(`${pickedRoot}\n${entry.path}`) === false) set.add(entry.path);
+          }
+        }
+        return set;
+      })();
 
       return h('div', {
         className: 'mrc-panel',
@@ -1073,7 +1126,7 @@ window.__ModuleLoader__.load({
             pickedRoot,
             onPickedRoot: setPickedRoot,
             visibleRoots,
-            checkedPaths,
+            checkedPaths: pickedChecked,
             onTogglePath: togglePath,
             onRefresh: () => {
               setTick((value) => value + 1);
@@ -1103,7 +1156,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mrc-roots' }, visibleRoots.map((root) => {
               // Files this root unchecked, projected from the global keyed set.
               const unchecked = new Set();
-              for (const key of checkedPaths) {
+              for (const key of uncheckedPaths) {
                 if (key.startsWith(`${root.path}\n`)) unchecked.add(key.slice(root.path.length + 1));
               }
               return h(RootSection, {
