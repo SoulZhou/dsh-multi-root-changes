@@ -322,7 +322,7 @@ window.__ModuleLoader__.load({
           className: isIncluded ? 'mrc-check mrc-checkOn' : 'mrc-check mrc-checkOff',
           title: isIncluded ? t('uncheckFile') : t('checkFile'),
           'aria-label': `${isIncluded ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
-          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, isIncluded); }
+          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, !isIncluded); }
         }, isIncluded ? '✓' : '')
         : null,
       h('button', {
