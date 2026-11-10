@@ -91,6 +91,7 @@ window.__ModuleLoader__.load({
         quickPushTitle: '推送：把选中仓库的本地提交上传到远端（需要网络）',
         quickCommitTitle: '提交：把选中仓库的全部改动写成本地提交；提交信息自动生成',
         suggestEmpty: 'AI 未能生成提交信息，请在下方输入框手写后提交',
+        refreshed: '已刷新 {time}',
         checkFile: '勾选：这个文件会随下一次提交一起提交',
         uncheckFile: '取消勾选：这个文件暂不提交',
         includedCount: '已选 {count}/{total} 个文件',
@@ -148,6 +149,7 @@ window.__ModuleLoader__.load({
         quickPushTitle: 'Push: upload the local commits of the selected repository to the remote (needs network)',
         quickCommitTitle: 'Commit: write all changes of the selected repository as a local commit; the message is drafted automatically',
         suggestEmpty: 'AI could not draft a message; type one in the box below and commit',
+        refreshed: 'Refreshed {time}',
         checkFile: 'Check: this file WILL be included in the next commit',
         uncheckFile: 'Uncheck: leave this file out of the commit for now',
         includedCount: '{count}/{total} files selected',
@@ -859,6 +861,18 @@ window.__ModuleLoader__.load({
       const [phase, setPhase] = useState(null);
       const [error, setError] = useState(null);
       const [notice, setNotice] = useState(null);
+      // Refresh feedback: the spin animation runs while the re-fetch is in
+      // flight, and a short "refreshed" note confirms the click even when the
+      // data did not change — silence reads as "the button does nothing".
+      const [spinning, setSpinning] = useState(false);
+      const [refreshedAt, setRefreshedAt] = useState(0);
+      // The confirmation note expires on its own; a second render ~2.5s later
+      // clears it. The timer is reset (not stacked) on every refresh click.
+      useEffect(() => {
+        if (refreshedAt === 0) return undefined;
+        const timer = setTimeout(() => setRefreshedAt(0), 2500);
+        return () => clearTimeout(timer);
+      }, [refreshedAt]);
 
       const repos = roots.filter((root) => root.status?.isRepo === true);
       const current = repos.find((root) => root.path === picked) ?? null;
@@ -952,16 +966,28 @@ window.__ModuleLoader__.load({
         ? visibleRoots.reduce((sum, root) => sum + (root.status?.entries?.length ?? 0), 0)
         : entries.length;
       const refreshScope = () => {
+        if (spinning) return;
+        setSpinning(true);
+        setError(null);
+        setNotice(null);
         onPickedRoot(picked);
-        onRefresh?.();
+        try { onRefresh?.(); } finally {
+          // Keep the spinner visible long enough to be seen even when the
+          // underlying fetch resolves instantly from cache.
+          setTimeout(() => {
+            setSpinning(false);
+            setRefreshedAt(Date.now());
+          }, 450);
+        }
       };
 
       return h('div', { className: 'mrc-quickBar' },
         h('button', {
           type: 'button',
-          className: 'mrc-iconButton',
+          className: spinning ? 'mrc-iconButton mrc-spinning' : 'mrc-iconButton',
           title: picked === '' ? t('refresh') : `${t('refresh')} · ${current.label}`,
           'aria-label': t('refresh'),
+          'aria-busy': spinning === true,
           onClick: refreshScope
         }, '↻'),
         h('span', { className: 'mrc-total mrc-scopeTotal' }, t('files', { count: scopeEntries })),
@@ -1001,6 +1027,11 @@ window.__ModuleLoader__.load({
         }, busy && phase !== null ? t('commitPushBusy') : t('commitPushAction')),
         error !== null ? h('span', { className: 'mrc-note mrc-error mrc-quickMsg' }, error) : null,
         notice !== null ? h('span', { className: 'mrc-note mrc-ok mrc-quickMsg' }, notice) : null,
+        // Short-lived "已刷新 HH:MM" confirmation that never fights with the
+        // action notices above: it only shows when nothing else is talking.
+        error === null && notice === null && refreshedAt > 0
+          ? h('span', { className: 'mrc-note mrc-refreshed' }, t('refreshed', { time: new Date(refreshedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }))
+          : null,
         current !== null && entries.length > 0
           ? h('span', { className: 'mrc-quickSelect' },
             h('span', { className: 'mrc-note' }, t('includedCount', { count: checkedCount, total: entries.length })),
@@ -1371,6 +1402,13 @@ window.__ModuleLoader__.load({
 /* Commit+Push is the strongest action in the bar: brand fill PLUS a subtle
    inner outline to stand apart from the plain Commit button beside it. */
 .mrc-commitPushButton { box-shadow: inset 0 0 0 1px var(--dsw-alias-label-primary); }
+/* Refresh feedback: the ↻ glyph spins while the re-fetch is in flight, and a
+   short-lived "已刷新 HH:MM" note confirms the click landed. The glyph is the
+   button's text node, so the whole button spins — not an inner svg. */
+.mrc-iconButton.mrc-spinning { color: var(--dsw-alias-state-business-primary);
+  animation: mrc-spin .8s linear infinite; pointer-events: none; }
+@keyframes mrc-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.mrc-refreshed { color: var(--dsw-alias-label-tertiary); font-size: 11px; }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
 /* Left/right split while a file or commit is open, stacked while it is not.
    The panel is a narrow column, so a vertical split (tree above, diff below) ate
