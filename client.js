@@ -305,17 +305,25 @@ window.__ModuleLoader__.load({
       const unstagedSide = reading?.unstaged;
       const side = unstagedSide ?? stagedSide;
       const isBinary = side?.binary === true;
-      return h('div', { className: selected ? 'mrc-fileRow mrc-rowActive' : 'mrc-fileRow' },
+      // Included-by-default semantics: `checked` is false when the file is
+      // in the unchecked set. The ✓ glyph renders ONLY on included rows so a
+      // bare box never reads as "checked"; excluded rows dim their name and
+      // show an empty box, which is the explicit "leave it out" marker.
+      const isIncluded = checked !== true;
+      const rowClass = ['mrc-fileRow'];
+      if (selected === true) rowClass.push('mrc-rowActive');
+      if (isIncluded === false) rowClass.push('mrc-rowExcluded');
+      return h('div', { className: rowClass.join(' ') },
       onToggle !== undefined
         ? h('button', {
           type: 'button',
           role: 'checkbox',
-          'aria-checked': checked !== true,
-          className: checked !== true ? 'mrc-check mrc-checkOn' : 'mrc-check',
-          title: checked !== true ? t('uncheckFile') : t('checkFile'),
-          'aria-label': `${checked !== true ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
-          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, checked === true); }
-        }, checked !== true ? '✓' : '')
+          'aria-checked': isIncluded,
+          className: isIncluded ? 'mrc-check mrc-checkOn' : 'mrc-check mrc-checkOff',
+          title: isIncluded ? t('uncheckFile') : t('checkFile'),
+          'aria-label': `${isIncluded ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
+          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, isIncluded); }
+        }, isIncluded ? '✓' : '')
         : null,
       h('button', {
         type: 'button',
@@ -1201,7 +1209,7 @@ window.__ModuleLoader__.load({
                 commitLimit: COMMIT_LIMIT,
                 sessionId,
                 refreshTick: manualTick,
-                checkedPaths: unchecked,
+                uncheckedPaths: unchecked,
                 onTogglePath: (filePath, checked) => togglePath(root.path, filePath, checked),
                 historyTick,
                 onCommitted: () => {
@@ -1325,6 +1333,11 @@ window.__ModuleLoader__.load({
   padding: 0; }
 .mrc-check:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .mrc-checkOn { color: var(--dsw-alias-state-success-primary); font-weight: 700; }
+/* Unchecked rows: an EMPTY box plus dimmed name, so "will not commit" is
+   visible without ever painting a second ✓-like glyph. */
+.mrc-checkOff { color: var(--dsw-alias-border-l2); }
+.mrc-rowExcluded .mrc-name { opacity: .45; }
+.mrc-rowExcluded .mrc-badge { opacity: .45; }
 .mrc-dirRow { color: var(--dsw-alias-label-secondary); }
 .mrc-dirName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mrc-dirCount { margin-left: auto; color: var(--dsw-alias-label-tertiary); font-size: 10px; }
