@@ -90,7 +90,16 @@ window.__ModuleLoader__.load({
         repoPickerTitle: '选择要显示和操作的仓库',
         quickPushTitle: '推送：把选中仓库的本地提交上传到远端（需要网络）',
         quickCommitTitle: '提交：把选中仓库的全部改动写成本地提交；提交信息自动生成',
-        suggestEmpty: 'AI 未能生成提交信息，请在下方输入框手写后提交'
+        suggestEmpty: 'AI 未能生成提交信息，请在下方输入框手写后提交',
+        checkFile: '勾选：这个文件会随下一次提交一起提交',
+        uncheckFile: '取消勾选：这个文件暂不提交',
+        includedCount: '已选 {count}/{total} 个文件',
+        includeAll: '全选',
+        includeNone: '全不选',
+        quickCommitPushTitle: '提交并推送：先写成本地提交（信息自动生成），再上传到远端（需要网络）',
+        commitPushAction: '提交+推送',
+        commitPushBusy: '提交并推送中…',
+        committedAndPushed: '已提交 {hash} 并推送 {branch}'
       },
       en: {
         tab: 'Multi-root changes',
@@ -138,7 +147,16 @@ window.__ModuleLoader__.load({
         repoPickerTitle: 'Choose which repository to show and act on',
         quickPushTitle: 'Push: upload the local commits of the selected repository to the remote (needs network)',
         quickCommitTitle: 'Commit: write all changes of the selected repository as a local commit; the message is drafted automatically',
-        suggestEmpty: 'AI could not draft a message; type one in the box below and commit'
+        suggestEmpty: 'AI could not draft a message; type one in the box below and commit',
+        checkFile: 'Check: this file WILL be included in the next commit',
+        uncheckFile: 'Uncheck: leave this file out of the commit for now',
+        includedCount: '{count}/{total} files selected',
+        includeAll: 'Check all',
+        includeNone: 'Uncheck all',
+        quickCommitPushTitle: 'Commit & push: write the selected changes as a local commit (message drafted automatically), then upload to the remote (needs network)',
+        commitPushAction: 'Commit+Push',
+        commitPushBusy: 'Committing and pushing…',
+        committedAndPushed: 'Committed {hash} and pushed {branch}'
       }
     };
 
@@ -276,18 +294,30 @@ window.__ModuleLoader__.load({
           .map((file) => ({ kind: 'file', ...file })));
     }
 
-    /** One changed-file row. */
+    /** One file row: checkbox (for partial commits) plus badge, name, counts. */
     function FileRow(props) {
-      const { entry, counts, selected, onSelect, depth } = props;
+      const { entry, counts, selected, checked, onToggle, onSelect, depth, t } = props;
       const badge = statusLetter(entry);
       const reading = counts?.[entry.path];
       const stagedSide = reading?.staged;
       const unstagedSide = reading?.unstaged;
       const side = unstagedSide ?? stagedSide;
       const isBinary = side?.binary === true;
-      return h('button', {
+      return h('div', { className: selected ? 'mrc-fileRow mrc-rowActive' : 'mrc-fileRow' },
+      onToggle !== undefined
+        ? h('button', {
+          type: 'button',
+          role: 'checkbox',
+          'aria-checked': checked === true,
+          className: checked === true ? 'mrc-check mrc-checkOn' : 'mrc-check',
+          title: checked === true ? t('uncheckFile') : t('checkFile'),
+          'aria-label': `${checked === true ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
+          onClick: (event) => { event.stopPropagation(); onToggle(entry.path); }
+        }, checked === true ? '✓' : '')
+        : null,
+      h('button', {
         type: 'button',
-        className: selected ? 'mrc-row mrc-rowActive' : 'mrc-row',
+        className: 'mrc-row',
         style: { paddingLeft: `${8 + depth * 12}px` },
         title: entry.origPath !== undefined ? `${entry.origPath} → ${entry.path}` : entry.path,
         onClick: () => onSelect(entry)
@@ -298,7 +328,7 @@ window.__ModuleLoader__.load({
         ? h('span', { className: 'mrc-counts' },
           side.additions > 0 ? h('span', { className: 'mrc-add' }, `+${side.additions}`) : null,
           side.deletions > 0 ? h('span', { className: 'mrc-del' }, `−${side.deletions}`) : null)
-        : null);
+        : null));
     }
 
     /** One directory row plus its children. */
@@ -675,7 +705,7 @@ window.__ModuleLoader__.load({
 
     /** One root's collapsible section: header, counters, tree. */
     function RootSection(props) {
-      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId, historyTick, refreshTick } = props;
+      const { root, t, selected, onSelectEntry, selectedCommit, onSelectCommit, commitLimit, onCommitted, sessionId, historyTick, refreshTick, checkedPaths, onTogglePath } = props;
       const status = root.status ?? {};
       const entries = Array.isArray(status.entries) ? status.entries : [];
       const [open, setOpen] = useState(true);
@@ -695,10 +725,13 @@ window.__ModuleLoader__.load({
           entry: node,
           counts: changed,
           depth,
+          t,
           selected: isSelected,
+          checked: checkedPaths?.has(node.path) === true,
+          onToggle: onTogglePath,
           onSelect: (entry) => onSelectEntry(root.path, entry)
         });
-      }, [root.path, changed, selected, onSelectEntry]);
+      }, [root.path, changed, selected, onSelectEntry, checkedPaths, onTogglePath, t]);
 
       return h('section', { className: 'mrc-root' },
         h('button', {
@@ -778,9 +811,10 @@ window.__ModuleLoader__.load({
      * (explicit paths, no force flags, up-to-date honesty) stay identical.
      */
     function QuickBar(props) {
-      const { roots, t, onCommitted, sessionId, pickedRoot, onPickedRoot } = props;
+      const { roots, t, onCommitted, sessionId, pickedRoot, onPickedRoot, visibleRoots, checkedPaths, onTogglePath, onRefresh } = props;
       const picked = pickedRoot;
       const [busy, setBusy] = useState(false);
+      const [phase, setPhase] = useState(null);
       const [error, setError] = useState(null);
       const [notice, setNotice] = useState(null);
 
@@ -788,10 +822,45 @@ window.__ModuleLoader__.load({
       const current = repos.find((root) => root.path === picked) ?? null;
       const entries = current?.status?.entries ?? [];
       const paths = entries.map((entry) => entry.path);
+      // What this quick bar may commit. A concrete selection commits exactly
+      // the CHECKED files (partial commit); "all projects" has no checkboxes
+      // and commits every changed file of the selected repository. Files that
+      // appear after a refresh join the checked set automatically.
+      const commitPaths = current === null
+        ? paths
+        : paths.filter((path) => checkedPaths?.has(path) !== false);
+      const checkedCount = current === null ? paths.length : commitPaths.length;
+
+      const draftMessage = async (root) => {
+        try {
+          const reply = await postJson('/suggest-message', {
+            root,
+            sessionId,
+            language: isZh() ? 'zh' : 'en',
+            focus: 'worktree'
+          });
+          return (reply.message ?? '').trim();
+        } catch {
+          // A failed draft must not block a manual flow: the caller falls
+          // through with an empty message and shows the handwritten hint.
+          return '';
+        }
+      };
+
+      const pushRepo = async (root) => {
+        const reply = await postJson('/push', { root });
+        const output = (reply.output ?? '').trim();
+        if (/everything up[- ]to[- ]date/i.test(output)) {
+          return { upToDate: true, branch: reply.branch ?? '' };
+        }
+        return { upToDate: false, branch: reply.branch ?? '' };
+      };
 
       const run = async (action) => {
         if (busy || current === null) return;
+        if (action !== 'push' && commitPaths.length === 0) return;
         setBusy(true);
+        setPhase(action === 'commitPush' ? 'committing' : null);
         setError(null);
         setNotice(null);
         try {
@@ -805,39 +874,55 @@ window.__ModuleLoader__.load({
             }
           } else {
             // The quick bar has no message input: draft one from the changes
-            // first, then commit the SAME explicit path list the action box
-            // would have committed. Nothing is committed without a message.
-            let message = '';
-            try {
-              const draft = await postJson('/suggest-message', {
-                root: current.path,
-                sessionId,
-                language: isZh() ? 'zh' : 'en',
-                focus: 'worktree'
-              });
-              message = (draft.message ?? '').trim();
-            } catch {
-              // A failed draft must not block a manual flow: fall through with
-              // an empty message and tell the user what happened.
-            }
+            // first, then commit the checked path list. Nothing is committed
+            // without a message, and the list stays explicit — never add -A.
+            const message = await draftMessage(current.path);
             if (message === '') {
               setError(t('suggestEmpty'));
               return;
             }
-            const reply = await postJson('/commit-write', { root: current.path, message, paths });
-            setNotice(t('committed', { hash: reply.hash ?? '' }));
+            const reply = await postJson('/commit-write', { root: current.path, message, paths: commitPaths });
+            if (action === 'commitPush') {
+              setPhase('pushing');
+              const pushed = await pushRepo(current.path);
+              setNotice(pushed.upToDate === true
+                ? t('committed', { hash: reply.hash ?? '' })
+                : t('committedAndPushed', { hash: reply.hash ?? '', branch: pushed.branch }));
+            } else {
+              setNotice(t('committed', { hash: reply.hash ?? '' }));
+            }
           }
           onCommitted?.();
         } catch (failure) {
           setError(String(failure.message || failure));
         } finally {
+          setPhase(null);
           setBusy(false);
         }
       };
 
       if (repos.length === 0) return null;
 
+      // The header counter and refresh follow the picker: "all projects"
+      // counts and refreshes EVERY registered root, a concrete choice counts
+      // and refreshes only that repository (same for the history/diff ticks).
+      const scopeEntries = current === null
+        ? visibleRoots.reduce((sum, root) => sum + (root.status?.entries?.length ?? 0), 0)
+        : entries.length;
+      const refreshScope = () => {
+        onPickedRoot(picked);
+        onRefresh?.();
+      };
+
       return h('div', { className: 'mrc-quickBar' },
+        h('button', {
+          type: 'button',
+          className: 'mrc-iconButton',
+          title: picked === '' ? t('refresh') : `${t('refresh')} · ${current.label}`,
+          'aria-label': t('refresh'),
+          onClick: refreshScope
+        }, '↻'),
+        h('span', { className: 'mrc-total mrc-scopeTotal' }, t('files', { count: scopeEntries })),
         h('select', {
           className: 'mrc-repoPicker',
           title: t('repoPickerTitle'),
@@ -857,16 +942,41 @@ window.__ModuleLoader__.load({
           disabled: busy || current === null,
           title: t('quickPushTitle'),
           onClick: () => { void run('push') }
-        }, busy && current !== null ? t('pushing') : t('pushAction')),
+        }, busy && phase === null ? t('pushing') : t('pushAction')),
         h('button', {
           type: 'button',
           className: 'mrc-commitButton',
-          disabled: busy || current === null || paths.length === 0,
+          disabled: busy || current === null || commitPaths.length === 0,
           title: t('quickCommitTitle'),
           onClick: () => { void run('commit') }
         }, t('commitAction')),
+        h('button', {
+          type: 'button',
+          className: 'mrc-commitButton mrc-commitPushButton',
+          disabled: busy || current === null || commitPaths.length === 0,
+          title: t('quickCommitPushTitle'),
+          onClick: () => { void run('commitPush') }
+        }, busy && phase !== null ? t('commitPushBusy') : t('commitPushAction')),
         error !== null ? h('span', { className: 'mrc-note mrc-error mrc-quickMsg' }, error) : null,
-        notice !== null ? h('span', { className: 'mrc-note mrc-ok mrc-quickMsg' }, notice) : null);
+        notice !== null ? h('span', { className: 'mrc-note mrc-ok mrc-quickMsg' }, notice) : null,
+        current !== null && entries.length > 0
+          ? h('span', { className: 'mrc-quickSelect' },
+            h('span', { className: 'mrc-note' }, t('includedCount', { count: checkedCount, total: entries.length })),
+            checkedCount < entries.length
+              ? h('button', {
+                type: 'button',
+                className: 'mrc-linkButton',
+                onClick: () => { for (const path of paths) onTogglePath?.(current.path, path, true) }
+              }, t('includeAll'))
+              : null,
+            checkedCount > 0
+              ? h('button', {
+                type: 'button',
+                className: 'mrc-linkButton',
+                onClick: () => { for (const path of paths) onTogglePath?.(current.path, path, false) }
+              }, t('includeNone'))
+              : null)
+          : null);
     }
 
     /** The tab's page body. */
@@ -929,7 +1039,23 @@ window.__ModuleLoader__.load({
       }, []);
 
       const roots = state.data?.roots ?? [];
-      const totalFiles = roots.reduce((sum, root) => sum + (root.status?.entries?.length ?? 0), 0);
+      // Partial-commit checkboxes: one SET of paths the user UNCHECKED, keyed
+      // by `${repoPath}\n${file}` and remembered per repository. Unlisted
+      // paths default to CHECKED, so nothing changes until the user opts a
+      // file out; the quick bar commits only the still-checked files.
+      const [checkedPaths, setCheckedPaths] = useState(() => new Set());
+      const togglePath = useCallback((rootPath, filePath, checked) => {
+        setCheckedPaths((prev) => {
+          const key = `${rootPath}\n${filePath}`;
+          const next = new Set(prev);
+          if (checked === true) next.delete(key);
+          else next.add(key);
+          return next;
+        });
+      }, []);
+      // The quick bar owns the header now: its counter and refresh follow the
+      // picker (all projects vs the chosen repository), so the toolbar row
+      // keeps only the title.
       const visibleRoots = pickedRoot === '' ? roots : roots.filter((root) => root.path === pickedRoot);
 
       return h('div', {
@@ -940,29 +1066,25 @@ window.__ModuleLoader__.load({
       },
         h('div', { className: 'mrc-bar' },
           h('span', { className: 'mrc-title' }, t('tab')),
-          h('span', { className: 'mrc-total' }, state.loading ? t('loading') : t('files', { count: totalFiles })),
-          h('button', {
-            type: 'button',
-            className: 'mrc-iconButton',
-            title: t('refresh'),
-            'aria-label': t('refresh'),
-            onClick: () => {
-              setTick((value) => value + 1);
-              setDiffTick((value) => value + 1);
-              setManualTick((value) => value + 1);
-            }
-          }, '↻')),
           h(QuickBar, {
             roots,
             t,
             sessionId,
             pickedRoot,
             onPickedRoot: setPickedRoot,
+            visibleRoots,
+            checkedPaths,
+            onTogglePath: togglePath,
+            onRefresh: () => {
+              setTick((value) => value + 1);
+              setDiffTick((value) => value + 1);
+              setManualTick((value) => value + 1);
+            },
             onCommitted: () => {
               setTick((value) => value + 1);
               setHistoryTick((value) => value + 1);
             }
-          }),
+          })),
 
         state.error !== null
           ? h('div', { className: 'mrc-note mrc-error' }, `${t('readFailed')}: ${state.error}`)
@@ -978,23 +1100,32 @@ window.__ModuleLoader__.load({
         // One row: the root list and the preview side by side (see .mrc-body).
         h('div', { className: 'mrc-body' },
           h('div', { className: 'mrc-rootsWrap' },
-            h('div', { className: 'mrc-roots' }, visibleRoots.map((root) => h(RootSection, {
-              key: root.path,
-              root,
-              t,
-              selected,
-              onSelectEntry,
-              selectedCommit,
-              onSelectCommit,
-              commitLimit: COMMIT_LIMIT,
-              sessionId,
-              historyTick,
-              refreshTick: manualTick,
-              onCommitted: () => {
-                setTick((value) => value + 1);
-                setHistoryTick((value) => value + 1);
+            h('div', { className: 'mrc-roots' }, visibleRoots.map((root) => {
+              // Files this root unchecked, projected from the global keyed set.
+              const unchecked = new Set();
+              for (const key of checkedPaths) {
+                if (key.startsWith(`${root.path}\n`)) unchecked.add(key.slice(root.path.length + 1));
               }
-            })))),
+              return h(RootSection, {
+                key: root.path,
+                root,
+                t,
+                selected,
+                onSelectEntry,
+                selectedCommit,
+                onSelectCommit,
+                commitLimit: COMMIT_LIMIT,
+                sessionId,
+                refreshTick: manualTick,
+                checkedPaths: unchecked,
+                onTogglePath: (filePath, checked) => togglePath(root.path, filePath, checked),
+                historyTick,
+                onCommitted: () => {
+                  setTick((value) => value + 1);
+                  setHistoryTick((value) => value + 1);
+                }
+              });
+            }))),
 
           selected !== null
             ? h('div', { className: 'mrc-diffPane' },
@@ -1098,6 +1229,18 @@ window.__ModuleLoader__.load({
   color: inherit; cursor: pointer; font: inherit; text-align: left; padding: 2px 8px; line-height: 18px; }
 .mrc-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .mrc-rowActive { background: var(--dsw-alias-interactive-bg-active); }
+/* A file row wraps a checkbox button and the existing row button; hover and
+   selection must light up BOTH parts as one surface. */
+.mrc-fileRow { display: flex; align-items: stretch; }
+.mrc-fileRow:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mrc-fileRow .mrc-row { flex: 1; min-width: 0; }
+/* The partial-commit checkbox: a small square that reads as checked (✓) or
+   empty, indented left of the status badge. */
+.mrc-check { flex: none; width: 18px; border: 0; background: transparent; cursor: pointer;
+  font: inherit; font-size: 10px; line-height: 18px; color: var(--dsw-alias-label-primary);
+  padding: 0; }
+.mrc-check:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mrc-checkOn { color: var(--dsw-alias-state-success-primary); font-weight: 700; }
 .mrc-dirRow { color: var(--dsw-alias-label-secondary); }
 .mrc-dirName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mrc-dirCount { margin-left: auto; color: var(--dsw-alias-label-tertiary); font-size: 10px; }
@@ -1162,6 +1305,19 @@ window.__ModuleLoader__.load({
 .mrc-repoPicker:focus { outline: 1px solid var(--dsw-alias-state-business-primary); }
 .mrc-quickMsg { font-size: 11px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; max-width: 40%; }
+/* The scoped counter next to the picker: same voice as the old mrc-total,
+   just placed inside the quick bar it belongs to. */
+.mrc-scopeTotal { margin-left: 0; flex: none; }
+/* The checked/total line and its Check-all / Uncheck-all links. */
+.mrc-quickSelect { display: inline-flex; align-items: center; gap: 6px; flex-basis: 100%;
+  padding-left: 2px; }
+.mrc-quickSelect .mrc-note { padding: 0; }
+.mrc-linkButton { border: 0; background: transparent; cursor: pointer; font: inherit;
+  font-size: 10px; color: var(--dsw-alias-state-business-primary); padding: 0; }
+.mrc-linkButton:hover { text-decoration: underline; }
+/* Commit+Push is the strongest action in the bar: brand fill PLUS a subtle
+   inner outline to stand apart from the plain Commit button beside it. */
+.mrc-commitPushButton { box-shadow: inset 0 0 0 1px var(--dsw-alias-label-primary); }
 .mrc-error { color: var(--dsw-alias-state-error-primary); }
 /* Left/right split while a file or commit is open, stacked while it is not.
    The panel is a narrow column, so a vertical split (tree above, diff below) ate
