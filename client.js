@@ -314,7 +314,7 @@ window.__ModuleLoader__.load({
           className: checked !== true ? 'mrc-check mrc-checkOn' : 'mrc-check',
           title: checked !== true ? t('uncheckFile') : t('checkFile'),
           'aria-label': `${checked !== true ? t('uncheckFile') : t('checkFile')} ${entry.path}`,
-          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, checked !== true); }
+          onClick: (event) => { event.stopPropagation(); onToggle(entry.path, checked === true); }
         }, checked !== true ? '✓' : '')
         : null,
       h('button', {
