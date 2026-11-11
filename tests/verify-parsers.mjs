@@ -88,7 +88,14 @@ console.log('\n=== 3. numstat including binary ===');
 }
 
 console.log('\n=== 4. REAL repositories ===');
-for (const repo of ['D:\\dev\\demo-platform\\web-console', 'D:\\dev\\demo-platform\\api-gateway', 'D:\\dev\\demo-platform\\shared-i18n']) {
+// The live repositories to exercise are supplied by the caller, so this script
+// never carries anyone's project layout. `MRC_TEST_REPOS` is a
+// path-separator-separated list; an unset value simply skips the section.
+const testRepos = (process.env.MRC_TEST_REPOS ?? '')
+  .split(/[;]/)
+  .map((entry) => entry.trim())
+  .filter((entry) => entry !== '');
+for (const repo of testRepos) {
   let raw;
   try {
     raw = await gitRaw(repo, ['-c', 'core.quotepath=false', '--no-pager', 'status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']);

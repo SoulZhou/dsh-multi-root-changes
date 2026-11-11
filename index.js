@@ -4,7 +4,8 @@
  * Why this plugin exists: DSH's built-in "Changes / Git" panel (and the one
  * dsh-better-sidebar draws) resolves repositories by scanning DOWNWARD from the
  * session's working directory. A very common layout — several sibling checkouts
- * (`F:\demo-platform\api-gateway`, `F:\demo-platform\shared-i18n`, …) beside the primary
+ * (`D:\dev\demo-platform\api-gateway`, `D:\dev\demo-platform\shared-i18n`, …)
+ * beside the primary
  * project — is therefore invisible: those repositories are not under the
  * session cwd, so the panel can only ever show the primary project's changes.
  *
@@ -421,8 +422,9 @@ async function readAdditionalRoots(primaryRoot) {
  * Whether one root is a git work tree, and its real top level.
  *
  * `git rev-parse --show-toplevel` reports FORWARD slashes with an uppercased
- * drive letter (`D:/dev/demo-platform/api-gateway`), while the registry stores backslashes
- * (`F:\demo-platform\api-gateway`) — so the comparison goes through {@link pathIdentity}
+ * drive letter (`D:/dev/demo-platform/api-gateway`), while the registry stores
+ * backslashes (`D:\dev\demo-platform\api-gateway`) — so the comparison goes
+ * through {@link pathIdentity}
  * (slash-normalized, case-insensitive on Windows), never string equality.
  */
 async function inspectRepo(root) {

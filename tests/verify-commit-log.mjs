@@ -51,7 +51,14 @@ console.log('\n=== 1. synthetic records ===');
 }
 
 console.log('\n=== 2. REAL repositories ===');
-for (const repo of ['D:\\dev\\demo-platform\\web-console', 'D:\\dev\\demo-platform\\api-gateway', 'D:\\dev\\demo-platform\\shared-i18n']) {
+// The live repositories to exercise are supplied by the caller, so this script
+// never carries anyone's project layout. `MRC_TEST_REPOS` is a
+// semicolon-separated list; an unset value simply skips the section.
+const testRepos = (process.env.MRC_TEST_REPOS ?? '')
+  .split(/[;]/)
+  .map((entry) => entry.trim())
+  .filter((entry) => entry !== '');
+for (const repo of testRepos) {
   let raw;
   try {
     raw = await gitRaw(repo, ['log', '-n30', '--no-color', '--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s']);
@@ -84,9 +91,13 @@ for (const repo of ['D:\\dev\\demo-platform\\web-console', 'D:\\dev\\demo-platfo
 
 console.log('\n=== 3. merge commit detection ===');
 {
-  // web-console history: find whether any merge commit exists, then confirm the
-  // parent-count rule separates it from an ordinary commit.
-  const repo = 'D:\\dev\\demo-platform\\web-console';
+  // The repository under test is supplied by the caller: find whether any
+  // merge commit exists, then confirm the parent-count rule separates it from
+  // an ordinary commit.
+  const repo = testRepos[0];
+  if (repo === undefined) {
+    console.log('  SKIP  no repository given (set MRC_TEST_REPOS)');
+  } else {
   const merges = (await gitRaw(repo, ['rev-list', '--merges', '-n', '5', 'HEAD']).catch(() => Buffer.from('')))
     .toString('utf8').trim();
   const hasMerge = merges !== '';
@@ -98,6 +109,7 @@ console.log('\n=== 3. merge commit detection ===');
   } else {
     check('ordinary commit has 2 rev-list fields', parents.length === 2, String(parents.length));
     console.log('        (this repository has no merge commits; rule checked on an ordinary one)');
+  }
   }
 }
 
