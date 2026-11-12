@@ -25,11 +25,17 @@
  * the upstream tracking branch so later pushes are one click.
  */
 import { execFile } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 const API = '/dsh-multi-root-changes/api';
+
+/** Panel font scale: allowed range and step (a tenth at a time). */
+const FONT_SCALE_MIN = 0.8;
+const FONT_SCALE_MAX = 1.6;
+const FONT_SCALE_STEP = 0.1;
+const DEFAULT_SETTINGS = { fontScale: 1 };
 
 /** Per-root ceiling on reported entries (git itself is also asked to stop). */
 const MAX_ENTRIES = 3000;
@@ -84,6 +90,46 @@ function dshHome() {
 
 function registryPath() {
   return join(dshHome(), 'storages', 'multi_root_workspace.json');
+}
+
+/** Plugin-owned durable settings file (separate from the multi-root registry). */
+function settingsPath() {
+  return join(dshHome(), 'storages', 'multi_root_changes_settings.json');
+}
+
+/**
+ * Whitelist + range-check user-supplied settings. Unknown keys are dropped,
+ * an out-of-range or non-numeric fontScale falls back to 1, and the value is
+ * snapped to the declared 0.1 step so the UI and disk never disagree.
+ */
+function sanitizeSettings(raw) {
+  let fontScale = DEFAULT_SETTINGS.fontScale;
+  if (raw !== null && typeof raw === 'object') {
+    const value = Number(raw.fontScale);
+    if (Number.isFinite(value)) {
+      const clamped = Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, value));
+      fontScale = Math.round(clamped * 10) / 10;
+    }
+  }
+  return { fontScale };
+}
+
+async function loadSettings() {
+  try {
+    const parsed = JSON.parse(await readFile(settingsPath(), 'utf8'));
+    return sanitizeSettings(parsed);
+  } catch {
+    // Missing / corrupt / unreadable file is an ordinary first-run state.
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+async function saveSettings(settings) {
+  const clean = sanitizeSettings(settings);
+  const file = settingsPath();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(clean, null, 2) + '\n', 'utf8');
+  return clean;
 }
 
 function sendJson(response, status, value) {
@@ -1252,6 +1298,32 @@ async function handleFileContent(request, response) {
   }
 }
 
+/**
+ * Read (GET) or write (POST) the panel's durable UI settings.
+ *
+ * The desktop web port changes on every launch, so browser localStorage is
+ * not durable across restarts. The value therefore lives in the plugin's own
+ * file under $DSH_HOME/storages. Only `fontScale` is accepted and it is
+ * clamped/snapped in sanitizeSettings; nothing else can be stored here.
+ */
+async function handleSettings(request, response) {
+  if (request.method === 'GET') {
+    sendJson(response, 200, await loadSettings());
+    return;
+  }
+  if (request.method === 'POST') {
+    const body = await readJsonBody(request);
+    try {
+      const clean = await saveSettings(body);
+      sendJson(response, 200, clean);
+    } catch (error) {
+      sendText(response, 500, error.message || 'settings write failed');
+    }
+    return;
+  }
+  sendText(response, 405, 'method not allowed');
+}
+
 /** Draft a commit message for one root and hand it back. */
 async function handleSuggestMessage(ctx, request, response) {
   const body = await readJsonBody(request);
@@ -1291,6 +1363,10 @@ export function apply(ctx) {
             if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
             return handleFileContent(request, response);
           }
+        },
+        {
+          path: `${API}/settings`,
+          handler: (request, response) => handleSettings(request, response)
         },
         {
           path: `${API}/log`,
@@ -1348,4 +1424,8 @@ export function apply(ctx) {
   });
 }
 
-export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog, handlePush, handleFileContent, looksBinary };
+export const __test = {
+  parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog, handlePush,
+  handleFileContent, looksBinary, sanitizeSettings, handleSettings, settingsPath,
+  FONT_SCALE_MIN, FONT_SCALE_MAX, FONT_SCALE_STEP, DEFAULT_SETTINGS
+};

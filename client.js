@@ -42,6 +42,11 @@ window.__ModuleLoader__.load({
     const POLL_MS = 8000;
     /** Commits fetched per root when a history section is expanded. */
     const COMMIT_LIMIT = 30;
+    /** Font-size setting: must match the host's FONT_SCALE_* constants. */
+    const FONT_MIN = 0.8;
+    const FONT_MAX = 1.6;
+    const FONT_STEP = 0.1;
+    const FONT_DEFAULT = 1;
 
     const COPY = {
       zh: {
@@ -102,7 +107,12 @@ window.__ModuleLoader__.load({
         markdownPreview: '预览',
         markdownSource: '源码',
         markdownPreviewTitle: '按 Markdown 排版渲染全文（当前文件内容）',
-        markdownSourceTitle: '查看该文件的差异 / 源码（改动补丁）'
+        markdownSourceTitle: '查看该文件的差异 / 源码（改动补丁）',
+        fontSize: '字体大小',
+        fontSmaller: '缩小字体',
+        fontLarger: '放大字体',
+        fontReset: '恢复默认字体大小',
+        fontScaleTitle: '当前 {percent}% · 点击 A− 缩小 / A+ 放大 / 双击数值恢复默认'
       },
       en: {
         tab: 'Multi-root changes',
@@ -162,7 +172,12 @@ window.__ModuleLoader__.load({
         markdownPreview: 'Preview',
         markdownSource: 'Source',
         markdownPreviewTitle: 'Render the whole current file as formatted Markdown',
-        markdownSourceTitle: 'Show this file’s diff / raw source (patch)'
+        markdownSourceTitle: 'Show this file’s diff / raw source (patch)',
+        fontSize: 'Font size',
+        fontSmaller: 'Smaller font',
+        fontLarger: 'Larger font',
+        fontReset: 'Reset font size',
+        fontScaleTitle: 'Now {percent}% · A− to shrink / A+ to grow / double-click the number to reset'
       }
     };
 
@@ -190,12 +205,13 @@ window.__ModuleLoader__.load({
       }, [zh]);
     }
 
-    /** POST one JSON body to this plugin's own same-origin route. */
-    async function postJson(path, body) {
+    /** Talk to this plugin's own same-origin routes. GET omits the body. */
+    async function apiJson(path, body) {
+      const isGet = body === undefined;
       const response = await fetch(`${API_BASE}${path}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body ?? {})
+        method: isGet ? 'GET' : 'POST',
+        headers: isGet ? undefined : { 'content-type': 'application/json' },
+        body: isGet ? undefined : JSON.stringify(body)
       });
       if (!response.ok) {
         let detail = `${response.status}`;
@@ -203,6 +219,11 @@ window.__ModuleLoader__.load({
         throw new Error(detail);
       }
       return response.json();
+    }
+
+    /** POST one JSON body to this plugin's own same-origin route. */
+    function postJson(path, body) {
+      return apiJson(path, body ?? {});
     }
 
     /**
@@ -1133,6 +1154,45 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Font-size control for the top toolbar: A− / percentage / A+ / reset.
+     *
+     * The parent owns `scale` and persists it through /settings; this component
+     * is deliberately stateless so a failed write can never leave the UI and
+     * the disk disagreeing for long (the parent rolls back on error).
+     */
+    function FontSizeControl(props) {
+      const { scale, t, onChange } = props;
+      const percent = Math.round(scale * 100);
+      const clamp = (value) => Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(value * 10) / 10));
+      const label = t('fontScaleTitle', { percent });
+      return h('div', { className: 'mrc-fontControl', title: label },
+        h('span', { className: 'mrc-fontLabel' }, t('fontSize')),
+        h('button', {
+          type: 'button',
+          className: 'mrc-fontBtn',
+          title: t('fontSmaller'),
+          'aria-label': t('fontSmaller'),
+          disabled: scale <= FONT_MIN + 0.001,
+          onClick: () => onChange(clamp(scale - FONT_STEP))
+        }, 'A−'),
+        h('button', {
+          type: 'button',
+          className: 'mrc-fontValue',
+          title: t('fontReset'),
+          'aria-label': `${label} · ${t('fontReset')}`,
+          onDoubleClick: () => onChange(FONT_DEFAULT)
+        }, `${percent}%`),
+        h('button', {
+          type: 'button',
+          className: 'mrc-fontBtn',
+          title: t('fontLarger'),
+          'aria-label': t('fontLarger'),
+          disabled: scale >= FONT_MAX - 0.001,
+          onClick: () => onChange(clamp(scale + FONT_STEP))
+        }, 'A+'));
+    }
+
+    /**
      * The quick bar above the root list: a repository picker, a scoped refresh
      * and the "checked files" controls. The commit/push ACTION buttons were
      * removed from here on purpose — each repository's CommitBox below is now
@@ -1264,6 +1324,9 @@ window.__ModuleLoader__.load({
       // commit history and clears stale commit/push messages, so an external
       // commit becomes visible without a commit action inside this panel.
       const [manualTick, setManualTick] = useState(0);
+      // Durable font scale, read from /settings on mount and written back on
+      // every change. Default 1 means "as designed" until the host answers.
+      const [fontScale, setFontScale] = useState(FONT_DEFAULT);
       // A parked tab body polls nothing; the host keeps every visited tab body
       // mounted, so an ungated timer would run panels nobody can see.
       const onScreen = visible !== false;
@@ -1275,6 +1338,34 @@ window.__ModuleLoader__.load({
       // later polls (and the user's own choices) must never be overridden.
       const [pickedRoot, setPickedRoot] = useState('');
       const autoPicked = useRef(false);
+
+      // Font size is a HOST-side setting (the desktop port changes every
+      // launch, so localStorage cannot survive a restart). Read it once when
+      // the tab mounts; the toolbar control writes it back on every change.
+      useEffect(() => {
+        let live = true;
+        apiJson('/settings')
+          .then((reply) => {
+            if (!live) return;
+            const value = Number(reply?.fontScale);
+            if (Number.isFinite(value)) setFontScale(Math.min(FONT_MAX, Math.max(FONT_MIN, value)));
+          })
+          .catch(() => { /* first run / host half not loaded yet: keep default */ });
+        return () => { live = false; };
+      }, []);
+
+      const changeFontScale = useCallback((next) => {
+        const value = Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(next * 10) / 10));
+        setFontScale(value);
+        // Persist and roll back only on a definite server-side rejection, so
+        // the visible size stays in sync with what was actually stored.
+        postJson('/settings', { fontScale: value })
+          .then((reply) => {
+            const saved = Number(reply?.fontScale);
+            if (Number.isFinite(saved)) setFontScale(saved);
+          })
+          .catch(() => { /* keep the chosen size for this session */ });
+      }, []);
 
       useEffect(() => {
         if (!onScreen || sessionId === undefined) return undefined;
@@ -1355,6 +1446,8 @@ window.__ModuleLoader__.load({
 
       return h('div', {
         className: 'mrc-panel',
+        // ONE variable scales every fixed-px font-size in the injected CSS.
+        style: { '--mrc-scale': fontScale },
         // Drives the left/right split: the stylesheet switches on this one
         // attribute instead of two different component trees.
         'data-preview': selected !== null || selectedCommit !== null ? 'true' : undefined
@@ -1374,7 +1467,8 @@ window.__ModuleLoader__.load({
               setDiffTick((value) => value + 1);
               setManualTick((value) => value + 1);
             }
-          })),
+          }),
+          h(FontSizeControl, { scale: fontScale, t, onChange: changeFontScale })),
 
         state.error !== null
           ? h('div', { className: 'mrc-note mrc-error' }, `${t('readFailed')}: ${state.error}`)
@@ -1489,7 +1583,21 @@ window.__ModuleLoader__.load({
 .mrc-bar { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1); flex: none;
   background: var(--dsw-alias-bg-layer-1, transparent); }
-.mrc-title { font-weight: 600; }
+.mrc-title { font-weight: 600; flex: none; }
+/* The quick bar takes the middle; the font control keeps a fixed slot on the
+   right so A− / % / A+ never jump around when the picker label changes. */
+.mrc-bar > .mrc-quickBar { flex: 1; min-width: 0; }
+.mrc-fontControl { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.mrc-fontLabel { color: var(--dsw-alias-label-tertiary); font-size: 10px; white-space: nowrap; }
+.mrc-fontBtn, .mrc-fontValue { border: 1px solid var(--dsw-alias-border-l2);
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  font: inherit; font-size: 11px; border-radius: 4px; height: 20px; }
+.mrc-fontBtn { width: 24px; font-weight: 600; }
+.mrc-fontValue { min-width: 44px; padding: 0 4px; text-align: center;
+  color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+.mrc-fontBtn:hover:not(:disabled), .mrc-fontValue:hover {
+  background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.mrc-fontBtn:disabled { opacity: .4; cursor: default; }
 .mrc-total { color: var(--dsw-alias-label-tertiary); margin-left: auto; font-size: 11px; }
 .mrc-iconButton { border: 0; background: transparent; color: var(--dsw-alias-label-secondary);
   cursor: pointer; border-radius: 4px; width: 20px; height: 20px; line-height: 1; font-size: 13px; }
@@ -1741,11 +1849,24 @@ window.__ModuleLoader__.load({
   white-space: pre-wrap; }
 `;
 
+    /**
+     * Inject the panel stylesheet once.
+     *
+     * Every `font-size: Npx` in CSS is rewritten to
+     * `calc(Npx * var(--mrc-scale, 1))` at injection time. The panel root sets
+     * --mrc-scale from the user's font-size setting, so ONE variable scales all
+     * 41 fixed-px declarations (tree, buttons, diff, history, markdown) together
+     * without maintaining a second set of rules. `font: inherit` controls then
+     * follow automatically. The variable is scoped to .mrc-panel, so a zoomed
+     * panel cannot change the shell around it.
+     */
     function ensureStyle() {
       if (document.getElementById(STYLE_ID) !== null) return;
+      const scaled = CSS.replace(/font-size:\s*(\d+(?:\.\d+)?)px/g,
+        (_match, px) => `font-size: calc(${px}px * var(--mrc-scale, 1))`);
       const element = document.createElement('style');
       element.id = STYLE_ID;
-      element.textContent = CSS;
+      element.textContent = scaled;
       document.head.appendChild(element);
     }
 

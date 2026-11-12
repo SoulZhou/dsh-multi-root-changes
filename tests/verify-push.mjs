@@ -167,6 +167,31 @@ console.log('\n=== 1. client: push button + active commit-history refresh ===');
     /function safeMarkdownUrl/.test(clientSrc) && /\^\(https\?:|mailto:\)/i.test(clientSrc));
   check('host registers the /file-content route',
     indexSrc.includes('`${API}/file-content`'));
+
+  // 0.3.14: durable font-size setting, scaled through one CSS variable.
+  check('host registers the /settings route',
+    indexSrc.includes('`${API}/settings`'));
+  check('host sanitizes fontScale (whitelist + clamp + step)',
+    /function sanitizeSettings/.test(indexSrc) &&
+    /FONT_SCALE_MIN/.test(indexSrc) && /FONT_SCALE_MAX/.test(indexSrc) &&
+    /Math\.round\(clamped \* 10\) \/ 10/.test(indexSrc));
+  check('settings live in the plugin-owned storages file',
+    /multi_root_changes_settings\.json/.test(indexSrc));
+  check('client reads /settings on mount',
+    /apiJson\('\/settings'\)/.test(clientSrc));
+  check('client writes /settings on change',
+    /postJson\('\/settings', \{ fontScale: value \}\)/.test(clientSrc));
+  check('panel root exposes --mrc-scale',
+    /'--mrc-scale': fontScale/.test(clientSrc));
+  check('CSS injection rewrites every font-size to a scaled calc()',
+    /CSS\.replace\(\/font-size:\\s\*\(\\d\+\(\?:\\\.\\d\+\)\?\)px\/g/.test(clientSrc) &&
+    /calc\(\$\{px\}px \* var\(--mrc-scale, 1\)\)/.test(clientSrc));
+  check('toolbar renders the font-size control',
+    /h\(FontSizeControl, \{ scale: fontScale/.test(clientSrc) &&
+    /function FontSizeControl/.test(clientSrc));
+  check('font control has A− / A+ / reset',
+    /t\('fontSmaller'\)/.test(clientSrc) && /t\('fontLarger'\)/.test(clientSrc) &&
+    /onDoubleClick: \(\) => onChange\(FONT_DEFAULT\)/.test(clientSrc));
 }
 
 console.log('\n=== 2. host: a deliberately safe /push route ===');

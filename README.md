@@ -110,6 +110,14 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
   「源码」回到原来的 diff / 差异视图。预览读的是当前文件全文（不是 diff 的改动片段），
   由新增的 `/file-content` 只读路由提供。渲染器自绘、纯文本节点构造，**不用 `innerHTML`**，
   链接只放行 `http/https/mailto/#`，不加载远程图片，避免打开一个文件就注入脚本或外联。
+- **字体大小设置**：顶部条最右侧有「字体大小　A− / 百分比 / A+」控件，整个面板
+  （文件树、操作框、diff、提交历史、Markdown 预览、按钮文字）**等比例缩放**，范围
+  80%–160%、每档 10%；到边界自动置灰，**双击中间的百分比恢复 100%**。缩放靠注入 CSS 时把
+  所有 `font-size: Npx` 统一改写为 `calc(Npx * var(--mrc-scale, 1))` 实现，一个变量覆盖全面板，
+  不会漏掉局部小字，也不会影响面板外的界面。
+- 设置值**跨重启保留**：由宿主 `/settings` 读写 `$DSH_HOME/storages/multi_root_changes_settings.json`
+  （桌面端口每次启动都变，`localStorage` 不可靠）。只接受 `fontScale` 一个键，超出范围或非法值
+  回退默认值，按 0.1 步长对齐；未知键一律丢弃。
 - 点其它文件仍在底部打开 diff，`×` 关闭，`↻` 重读。
 - 不可见时自动停止轮询，8 秒一次（可见时）。
 
@@ -131,7 +139,8 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
 - **AI 生成只读**：起草提交信息时只把当前目录的 diff 与文件名喂给模型，不写仓库、不碰凭据
   （由宿主 `ctx.llm` 解析 provider），并且只取 `text-delta`，模型「思考过程」不会混进提交信息。
 - 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state`、`/diff`、`/file-content`、
-  `/log`、`/commit`、`/commit-write`、`/suggest-message`、`/push`。
+  `/settings`、`/log`、`/commit`、`/commit-write`、`/suggest-message`、`/push`。
+  `/settings` 只读写字体大小这一项插件自有设置，不碰工作区文件。
 - 提交 hash 在进入命令行前只放行十六进制对象 id，因此不会被当作 flag 或 rev 表达式。
 
 ## 已知边界
@@ -156,6 +165,8 @@ node tests/verify-commit-log.mjs    # 提交历史解析器：合成记录 + 真
 node tests/verify-push.mjs          # 推送 / 提交 / 主目录默认 / Markdown 预览链路回归
 node tests/verify-file-content.mjs  # /file-content 只读全文路由：路径穿越、非仓库、二进制、上限
 node tests/verify-markdown.mjs      # Markdown 渲染器：块级语法、链接白名单、XSS 注入防护
+node tests/verify-settings.mjs      # /settings 字体大小：白名单、范围、步长、落盘读回
+node tests/verify-font-scale.cjs    # 无头 Chromium 实测 computed font-size 按倍率缩放、不溢出面板
 ```
 
 前两个脚本的「真实仓库」一段由调用方通过环境变量给出，仓库里不写死任何人的目录布局：
