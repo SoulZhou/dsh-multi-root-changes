@@ -71,10 +71,10 @@ window.__ModuleLoader__.load({
         commits: '提交历史',
         noCommits: '这个仓库还没有提交',
         mergeCommit: '合并提交（{count} 个父提交），无单一差异',
-        commitPlaceholder: '提交信息（Ctrl+Enter 提交）',
+        commitPlaceholder: '提交信息（留空自动 AI 生成 · Ctrl+Enter 提交）',
         commitAction: '提交',
         committing: '提交中…',
-        commitTitle: '提交：把改动写成本地提交（存进本机仓库，不联网）',
+        commitTitle: '提交：把已勾选的改动写成本地提交（存进本机仓库，不联网）；信息留空时自动生成',
         pushAction: '推送',
         pushing: '推送中…',
         pushed: '已推送 {branch}',
@@ -88,8 +88,6 @@ window.__ModuleLoader__.load({
         committed: '已提交 {hash}',
         allRoots: '所有项目',
         repoPickerTitle: '选择要显示和操作的仓库',
-        quickPushTitle: '推送：把选中仓库的本地提交上传到远端（需要网络）',
-        quickCommitTitle: '提交：把选中仓库的全部改动写成本地提交；提交信息自动生成',
         suggestEmpty: 'AI 未能生成提交信息，请在下方输入框手写后提交',
         refreshed: '已刷新 {time}',
         checkFile: '勾选：这个文件会随下一次提交一起提交',
@@ -97,7 +95,7 @@ window.__ModuleLoader__.load({
         includedCount: '已选 {count}/{total} 个文件',
         includeAll: '全选',
         includeNone: '全不选',
-        quickCommitPushTitle: '提交并推送：先写成本地提交（信息自动生成），再上传到远端（需要网络）',
+        commitBoxCommitPushTitle: '提交并推送：把已勾选的改动写成本地提交（信息留空自动生成），再上传到远端（需要网络）',
         commitPushAction: '提交+推送',
         commitPushBusy: '提交并推送中…',
         committedAndPushed: '已提交 {hash} 并推送 {branch}'
@@ -129,10 +127,10 @@ window.__ModuleLoader__.load({
         commits: 'Commit history',
         noCommits: 'This repository has no commits yet',
         mergeCommit: 'Merge commit ({count} parents) — no single diff to show',
-        commitPlaceholder: 'Commit message (Ctrl+Enter to commit)',
+        commitPlaceholder: 'Commit message (empty = AI draft · Ctrl+Enter to commit)',
         commitAction: 'Commit',
         committing: 'Committing…',
-        commitTitle: 'Commit: write the changes as a local commit (stays on this machine, no network)',
+        commitTitle: 'Commit: write the CHECKED changes as a local commit (stays on this machine, no network); drafts a message when empty',
         pushAction: 'Push',
         pushing: 'Pushing…',
         pushed: 'Pushed {branch}',
@@ -146,8 +144,6 @@ window.__ModuleLoader__.load({
         committed: 'Committed {hash}',
         allRoots: 'All projects',
         repoPickerTitle: 'Choose which repository to show and act on',
-        quickPushTitle: 'Push: upload the local commits of the selected repository to the remote (needs network)',
-        quickCommitTitle: 'Commit: write all changes of the selected repository as a local commit; the message is drafted automatically',
         suggestEmpty: 'AI could not draft a message; type one in the box below and commit',
         refreshed: 'Refreshed {time}',
         checkFile: 'Check: this file WILL be included in the next commit',
@@ -155,7 +151,7 @@ window.__ModuleLoader__.load({
         includedCount: '{count}/{total} files selected',
         includeAll: 'Check all',
         includeNone: 'Uncheck all',
-        quickCommitPushTitle: 'Commit & push: write the selected changes as a local commit (message drafted automatically), then upload to the remote (needs network)',
+        commitBoxCommitPushTitle: 'Commit & push: write the CHECKED changes as a local commit (drafts a message when empty), then upload to the remote (needs network)',
         commitPushAction: 'Commit+Push',
         commitPushBusy: 'Committing and pushing…',
         committedAndPushed: 'Committed {hash} and pushed {branch}'
@@ -572,9 +568,19 @@ window.__ModuleLoader__.load({
           : null);
     }
 
-    /** One root's action box: message, AI draft, Commit and Push. */
+    /**
+     * One root's action box: message, AI draft, Commit and Push.
+     *
+     * The quick bar at the top no longer has its own action buttons; this box is
+     * now the SINGLE place to commit/push. So it carries the quick bar's logic:
+     * it commits only the CHECKED files, drafts a message when the box is left
+     * empty, and its Commit+Push runs the same "draft -> commit -> push, stop on
+     * failure" three-step flow. `checkedPaths` is the SET of still-checked paths
+     * (projected from the tab's unchecked-key set), so unchecking a file above
+     * keeps it out of `git add`/`git commit` here too.
+     */
     function CommitBox(props) {
-      const { root, t, onCommitted, sessionId, refreshTick } = props;
+      const { root, t, onCommitted, sessionId, refreshTick, checkedPaths } = props;
       const [message, setMessage] = useState('');
       const [busy, setBusy] = useState(false);
       const [suggesting, setSuggesting] = useState(false);
@@ -592,12 +598,36 @@ window.__ModuleLoader__.load({
       }, [refreshTick]);
 
       const entries = root.status?.entries ?? [];
-      // The box commits the WORKING TREE set: every changed path the panel is
-      // showing. Explicitly named, never `git add -A`.
       const paths = entries.map((entry) => entry.path);
+      // The box commits the CHECKED subset, never `git add -A`. When the caller
+      // does not supply a set (e.g. legacy callers), every shown path is used.
+      const commitPaths = checkedPaths === undefined
+        ? paths
+        : paths.filter((path) => checkedPaths.has(path) === true);
+      const checkedCount = commitPaths.length;
+
+      // Shared by every commit action: a handwritten message wins; when the box
+      // is empty, draft one from the worktree (same endpoint/shape as the quick
+      // bar). An empty draft is a hard stop, not an empty commit message.
+      const draftMessage = async () => {
+        const typed = message.trim();
+        if (typed !== '') return typed;
+        setSuggesting(true);
+        try {
+          const reply = await postJson('/suggest-message', {
+            root: root.path,
+            sessionId,
+            language: isZh() ? 'zh' : 'en',
+            focus: 'worktree'
+          });
+          return (reply.message ?? '').trim();
+        } finally {
+          setSuggesting(false);
+        }
+      };
 
       const suggest = async () => {
-        if (suggesting || busy || pushing || paths.length === 0) return;
+        if (suggesting || busy || pushing || commitPaths.length === 0) return;
         setSuggesting(true);
         setError(null);
         setNotice(null);
@@ -618,12 +648,17 @@ window.__ModuleLoader__.load({
 
       const commit = async () => {
         if (busy || suggesting || pushing) return;
-        if (message.trim() === '' || paths.length === 0) return;
+        if (commitPaths.length === 0) return;
         setBusy(true);
         setError(null);
         setNotice(null);
         try {
-          const reply = await postJson('/commit-write', { root: root.path, message, paths });
+          const finalMessage = await draftMessage();
+          if (finalMessage === '') {
+            setError(t('suggestEmpty'));
+            return;
+          }
+          const reply = await postJson('/commit-write', { root: root.path, message: finalMessage, paths: commitPaths });
           setNotice(t('committed', { hash: reply.hash ?? '' }));
           setMessage('');
           onCommitted?.();
@@ -667,20 +702,25 @@ window.__ModuleLoader__.load({
 
       const anyBusy = busy || suggesting || pushing;
 
-      // Commit+push: the quick bar's one-click flow for the per-repo box too —
-      // the message the user typed becomes the commit, then that commit is
-      // pushed. "Everything up-to-date" right after a commit is a remote-side
-      // quirk, so the notice states the commit landed and nothing transferred.
-      // A failed push after a landed commit must SAY the commit landed,
-      // otherwise the user would re-commit and duplicate it.
+      // Commit+push: three steps, fail-fast — draft a message (or use the typed
+      // one) -> commit the CHECKED files -> push. "Everything up-to-date" right
+      // after a commit is a remote-side quirk, so the notice states the commit
+      // landed and nothing transferred. A failed push after a landed commit must
+      // SAY the commit landed, otherwise the user would re-commit and duplicate
+      // it. This mirrors the quick bar's one-click flow exactly.
       const commitPush = async () => {
         if (anyBusy) return;
-        if (message.trim() === '' || paths.length === 0) return;
+        if (commitPaths.length === 0) return;
         setBusy(true);
         setError(null);
         setNotice(null);
         try {
-          const reply = await postJson('/commit-write', { root: root.path, message, paths });
+          const finalMessage = await draftMessage();
+          if (finalMessage === '') {
+            setError(t('suggestEmpty'));
+            return;
+          }
+          const reply = await postJson('/commit-write', { root: root.path, message: finalMessage, paths: commitPaths });
           setMessage('');
           try {
             const pushed = await postJson('/push', { root: root.path });
@@ -723,11 +763,11 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'mrc-aiButton',
-            disabled: anyBusy || paths.length === 0,
+            disabled: anyBusy || commitPaths.length === 0,
             title: t('aiGenerate'),
             onClick: () => { void suggest() }
           }, suggesting ? t('generating') : `✦ ${t('aiGenerate')}`),
-          h('span', { className: 'mrc-commitCount' }, t('files', { count: paths.length })),
+          h('span', { className: 'mrc-commitCount' }, t('includedCount', { count: checkedCount, total: paths.length })),
           // Push does not commit and does not depend on the changed-path set,
           // so the only gate is whether another write is already in flight.
           h('button', {
@@ -740,15 +780,15 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'mrc-commitButton',
-            disabled: anyBusy || message.trim() === '' || paths.length === 0,
+            disabled: anyBusy || commitPaths.length === 0,
             title: t('commitTitle'),
             onClick: () => { void commit() }
           }, busy ? t('committing') : t('commitAction')),
           h('button', {
             type: 'button',
             className: 'mrc-commitButton mrc-commitPushButton',
-            disabled: anyBusy || message.trim() === '' || paths.length === 0,
-            title: t('quickCommitPushTitle'),
+            disabled: anyBusy || commitPaths.length === 0,
+            title: t('commitBoxCommitPushTitle'),
             onClick: () => { void commitPush() }
           }, busy ? t('commitPushBusy') : t('commitPushAction'))),
         error !== null ? h('div', { className: 'mrc-note mrc-error' }, error) : null,
@@ -835,8 +875,17 @@ window.__ModuleLoader__.load({
           // Every REPO gets the action box, not only repos with pending
           // changes: after a clean commit (or on an already-clean repo) the
           // user still needs the Push button to send that commit upstream.
+          // The box commits exactly the still-CHECKED files, projected from
+          // the same unchecked-key set the quick bar's counters use.
           hasRepo
-            ? h(CommitBox, { root, t, sessionId, onCommitted, refreshTick })
+            ? h(CommitBox, {
+              root,
+              t,
+              sessionId,
+              onCommitted,
+              refreshTick,
+              checkedPaths: new Set(entries.filter((entry) => uncheckedPaths?.has(entry.path) !== true).map((entry) => entry.path))
+            })
             : null,
           hasRepo
             ? h(CommitSection, {
@@ -853,20 +902,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The quick bar above the root list: a repository picker plus one-click
-     * Push and Commit that act on the SELECTED repository.
-     *
-     * The picker is the compact way to reach any of the registered roots —
-     * "所有项目" shows every root's accordion as before, while a concrete
-     * choice collapses the view down to that one repository. The two buttons
-     * reuse the same endpoints as each repo's action box, so the safety rules
-     * (explicit paths, no force flags, up-to-date honesty) stay identical.
+     * The quick bar above the root list: a repository picker, a scoped refresh
+     * and the "checked files" controls. The commit/push ACTION buttons were
+     * removed from here on purpose — each repository's CommitBox below is now
+     * the single place to commit and push, and it consumes the same checked set
+     * this bar lets you edit. Keeping the two in sync means "全选 / 全不选"
+     * here decides exactly what the buttons below will commit.
      */
     function QuickBar(props) {
-      const { roots, t, onCommitted, sessionId, pickedRoot, onPickedRoot, visibleRoots, checkedPaths, onTogglePath, onRefresh } = props;
+      const { roots, t, pickedRoot, onPickedRoot, visibleRoots, checkedPaths, onTogglePath, onRefresh } = props;
       const picked = pickedRoot;
-      const [busy, setBusy] = useState(false);
-      const [phase, setPhase] = useState(null);
       const [error, setError] = useState(null);
       const [notice, setNotice] = useState(null);
       // Refresh feedback: the spin animation runs while the re-fetch is in
@@ -886,84 +931,12 @@ window.__ModuleLoader__.load({
       const current = repos.find((root) => root.path === picked) ?? null;
       const entries = current?.status?.entries ?? [];
       const paths = entries.map((entry) => entry.path);
-      // What this quick bar may commit. A concrete selection commits exactly
-      // the CHECKED files (partial commit); "all projects" has no checkboxes
-      // and commits every changed file of the selected repository. Files that
-      // appear after a refresh join the checked set automatically.
-      const commitPaths = current === null
-        ? paths
-        : paths.filter((path) => checkedPaths?.has(path) === true);
-      const checkedCount = current === null ? paths.length : commitPaths.length;
-
-      const draftMessage = async (root) => {
-        try {
-          const reply = await postJson('/suggest-message', {
-            root,
-            sessionId,
-            language: isZh() ? 'zh' : 'en',
-            focus: 'worktree'
-          });
-          return (reply.message ?? '').trim();
-        } catch {
-          // A failed draft must not block a manual flow: the caller falls
-          // through with an empty message and shows the handwritten hint.
-          return '';
-        }
-      };
-
-      const pushRepo = async (root) => {
-        const reply = await postJson('/push', { root });
-        const output = (reply.output ?? '').trim();
-        if (/everything up[- ]to[- ]date/i.test(output)) {
-          return { upToDate: true, branch: reply.branch ?? '' };
-        }
-        return { upToDate: false, branch: reply.branch ?? '' };
-      };
-
-      const run = async (action) => {
-        if (busy || current === null) return;
-        if (action !== 'push' && commitPaths.length === 0) return;
-        setBusy(true);
-        setPhase(action === 'commitPush' ? 'committing' : null);
-        setError(null);
-        setNotice(null);
-        try {
-          if (action === 'push') {
-            const reply = await postJson('/push', { root: current.path });
-            const output = (reply.output ?? '').trim();
-            if (/everything up[- ]to[- ]date/i.test(output)) {
-              setNotice(t('pushUpToDate'));
-            } else {
-              setNotice(t('pushed', { branch: reply.branch ?? '' }));
-            }
-          } else {
-            // The quick bar has no message input: draft one from the changes
-            // first, then commit the checked path list. Nothing is committed
-            // without a message, and the list stays explicit — never add -A.
-            const message = await draftMessage(current.path);
-            if (message === '') {
-              setError(t('suggestEmpty'));
-              return;
-            }
-            const reply = await postJson('/commit-write', { root: current.path, message, paths: commitPaths });
-            if (action === 'commitPush') {
-              setPhase('pushing');
-              const pushed = await pushRepo(current.path);
-              setNotice(pushed.upToDate === true
-                ? t('committed', { hash: reply.hash ?? '' })
-                : t('committedAndPushed', { hash: reply.hash ?? '', branch: pushed.branch }));
-            } else {
-              setNotice(t('committed', { hash: reply.hash ?? '' }));
-            }
-          }
-          onCommitted?.();
-        } catch (failure) {
-          setError(String(failure.message || failure));
-        } finally {
-          setPhase(null);
-          setBusy(false);
-        }
-      };
+      // How many files are still checked IN THE PICKED repository. This is the
+      // same count the per-repo CommitBox will commit, so the number shown here
+      // and the buttons below never disagree.
+      const checkedCount = current === null
+        ? paths.length
+        : paths.filter((path) => checkedPaths?.has(path) === true).length;
 
       if (repos.length === 0) return null;
 
@@ -1012,27 +985,6 @@ window.__ModuleLoader__.load({
         },
         h('option', { value: '' }, t('allRoots')),
         repos.map((repo) => h('option', { key: repo.path, value: repo.path }, repo.label))),
-        h('button', {
-          type: 'button',
-          className: 'mrc-pushButton',
-          disabled: busy || current === null,
-          title: t('quickPushTitle'),
-          onClick: () => { void run('push') }
-        }, busy && phase === null ? t('pushing') : t('pushAction')),
-        h('button', {
-          type: 'button',
-          className: 'mrc-commitButton',
-          disabled: busy || current === null || commitPaths.length === 0,
-          title: t('quickCommitTitle'),
-          onClick: () => { void run('commit') }
-        }, t('commitAction')),
-        h('button', {
-          type: 'button',
-          className: 'mrc-commitButton mrc-commitPushButton',
-          disabled: busy || current === null || commitPaths.length === 0,
-          title: t('quickCommitPushTitle'),
-          onClick: () => { void run('commitPush') }
-        }, busy && phase !== null ? t('commitPushBusy') : t('commitPushAction')),
         error !== null ? h('span', { className: 'mrc-note mrc-error mrc-quickMsg' }, error) : null,
         notice !== null ? h('span', { className: 'mrc-note mrc-ok mrc-quickMsg' }, notice) : null,
         // Short-lived "已刷新 HH:MM" confirmation that never fights with the
@@ -1123,7 +1075,8 @@ window.__ModuleLoader__.load({
       // Partial-commit checkboxes: one SET of paths the user UNCHECKED, keyed
       // by `${repoPath}\n${file}` and remembered per repository. Unlisted
       // paths default to CHECKED, so nothing changes until the user opts a
-      // file out; the quick bar commits only the still-checked files.
+      // file out; both the quick bar's counter AND the per-repo CommitBox
+      // consume this set, so unchecking a file keeps it out of the commit.
       const [uncheckedPaths, setUncheckedPaths] = useState(() => new Set());
       const togglePath = useCallback((rootPath, filePath, checked) => {
         setUncheckedPaths((prev) => {
@@ -1134,12 +1087,13 @@ window.__ModuleLoader__.load({
           return next;
         });
       }, []);
-      // The quick bar owns the header now: its counter and refresh follow the
+      // The quick bar owns the header: its counter and refresh follow the
       // picker (all projects vs the chosen repository), so the toolbar row
       // keeps only the title.
       const visibleRoots = pickedRoot === '' ? roots : roots.filter((root) => root.path === pickedRoot);
-      // QuickBar consumes a SET of CHECKED paths of the picked repo (its own
-      // default-checked semantics); project it from the unchecked-key set.
+      // QuickBar and each CommitBox consume a SET of CHECKED paths of the
+      // picked repo (default-checked semantics); project it from the
+      // unchecked-key set.
       const pickedChecked = (() => {
         const set = new Set();
         if (pickedRoot !== '') {
@@ -1161,7 +1115,6 @@ window.__ModuleLoader__.load({
           h(QuickBar, {
             roots,
             t,
-            sessionId,
             pickedRoot,
             onPickedRoot: setPickedRoot,
             visibleRoots,
@@ -1171,10 +1124,6 @@ window.__ModuleLoader__.load({
               setTick((value) => value + 1);
               setDiffTick((value) => value + 1);
               setManualTick((value) => value + 1);
-            },
-            onCommitted: () => {
-              setTick((value) => value + 1);
-              setHistoryTick((value) => value + 1);
             }
           })),
 
@@ -1353,9 +1302,11 @@ window.__ModuleLoader__.load({
 .mrc-note { padding: 6px 12px; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
 .mrc-ok { color: var(--dsw-alias-state-success-primary); }
 /* The commit box sits between the file tree and the history: message first,
-   then the actions (AI draft / Push / Commit) on one row so the panel stays
-   dense. Commit is the brand-filled primary action; Push is a secondary
-   outline button so the two write actions read as different strengths. */
+   then the actions (AI draft / Push / Commit / Commit+Push) on one row so the
+   panel stays dense. It is the ONLY commit/push entry now — the quick bar's
+   action buttons were removed so there is one place to act. Commit is the
+   brand-filled primary action; Push is a secondary outline button so the two
+   write actions read as different strengths. */
 .mrc-commitBox { border-top: 1px dashed var(--dsw-alias-border-l1); padding: 6px 8px; display: flex;
   flex-direction: column; gap: 4px; }
 .mrc-commitInput { width: 100%; box-sizing: border-box; resize: vertical; min-height: 34px;
@@ -1390,9 +1341,9 @@ window.__ModuleLoader__.load({
   color: #0b0f14; }
 .mrc-commitButton:hover:not(:disabled) { filter: brightness(1.08); }
 .mrc-aiButton:disabled, .mrc-pushButton:disabled, .mrc-commitButton:disabled { opacity: .45; cursor: default; }
-/* The quick bar: a repository picker plus one-click Push/Commit for the
-   selected repository, so the common "pick a repo, ship it" flow does not
-   require expanding each root's accordion to find its action box. */
+/* The quick bar: a repository picker, scoped refresh and the checked-file
+   controls. Commit/push live in each root's CommitBox below, so this row only
+   decides WHICH repo and WHICH files the buttons below act on. */
 .mrc-quickBar { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1); flex-wrap: wrap; }
 .mrc-repoPicker { flex: 1; min-width: 0; max-width: 260px; font: inherit; font-size: 11px;

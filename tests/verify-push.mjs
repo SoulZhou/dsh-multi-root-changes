@@ -117,8 +117,26 @@ console.log('\n=== 1. client: push button + active commit-history refresh ===');
   // Regression guard: the original Commit button and its tests must survive.
   check('.mrc-commitButton selector preserved',
     clientSrc.includes("className: 'mrc-commitButton'"));
-  check('Commit stays disabled while the message is empty',
-    /className: 'mrc-commitButton'[\s\S]{0,160}message\.trim\(\) === ''/.test(clientSrc));
+  // 0.3.12: the quick bar's action buttons were removed; CommitBox is now the
+  // single commit/push entry and carries the quick bar's logic. The Commit
+  // button is gated on CHECKED files, NOT on a handwritten message (an empty
+  // box now auto-drafts the message, mirroring the old quick bar flow).
+  check('Commit is gated on checked files, not an empty message',
+    /className: 'mrc-commitButton'[\s\S]{0,180}disabled: anyBusy \|\| commitPaths\.length === 0/.test(clientSrc));
+  check('Commit commits the CHECKED subset (partial commit)',
+    /postJson\('\/commit-write', \{ root: root\.path, message: finalMessage, paths: commitPaths \}\)/.test(clientSrc));
+  check('empty message auto-drafts before committing',
+    /const finalMessage = await draftMessage\(\);/.test(clientSrc) &&
+    /if \(finalMessage === ''\)/.test(clientSrc) &&
+    /setError\(t\('suggestEmpty'\)\)/.test(clientSrc));
+  check('CommitBox shows the checked/total count',
+    /t\('includedCount', \{ count: checkedCount, total: paths\.length \}\)/.test(clientSrc));
+  // The three action buttons must be gone from the quick bar (only ↻, counter,
+  // picker, count and check-all links remain). Detect by class usage: the
+  // button classes now appear ONLY inside CommitBox, never in QuickBar's render.
+  check('quick bar no longer renders push/commit/commit+push buttons',
+    !/quickPushTitle|quickCommitTitle|quickCommitPushTitle/.test(
+      clientSrc.slice(clientSrc.indexOf('function QuickBar'), clientSrc.indexOf('/** The tab\'s page body'))));
 
   check('zh copy has push keys',
     clientSrc.includes("pushAction: '推送'") && clientSrc.includes("pushing: '推送中…'") && clientSrc.includes("pushed: '已推送 {branch}'"));
