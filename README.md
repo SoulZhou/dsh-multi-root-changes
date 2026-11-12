@@ -102,12 +102,22 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
   操作框第一行常驻提示「提交 = 存进本地仓库 · 推送 = 上传到远端仓库」，各按钮的
   悬停提示也写明会不会联网。
 - 每节底部的「提交历史」可展开该仓库自己的最近 30 条提交，点一条看它的 patch。
-- 点文件在底部打开 diff，`×` 关闭，`↻` 重读。
+- **默认显示主目录**：打开页签时「选择目录」下拉框自动选中会话主工作区（`kind=primary`），
+  只列它的改动；「所有项目」和其它附加根仍在下拉框里，随时可切换。首次 `/state` 返回后
+  设置一次，之后不覆盖你自己的选择。
+- **Markdown 文件显示**：点 `.md` / `.markdown` 文件时，默认按 Markdown 排版渲染**全文**
+  （标题、粗体/斜体、列表、引用、表格、代码块、链接），顶部有「预览 / 源码」切换；
+  「源码」回到原来的 diff / 差异视图。预览读的是当前文件全文（不是 diff 的改动片段），
+  由新增的 `/file-content` 只读路由提供。渲染器自绘、纯文本节点构造，**不用 `innerHTML`**，
+  链接只放行 `http/https/mailto/#`，不加载远程图片，避免打开一个文件就注入脚本或外联。
+- 点其它文件仍在底部打开 diff，`×` 关闭，`↻` 重读。
 - 不可见时自动停止轮询，8 秒一次（可见时）。
 
 ## 访问级别与安全
 
-- **读操作**：`status` / `rev-parse` / `log` / `show` / `diff`，不改动任何东西。
+- **读操作**：`status` / `rev-parse` / `log` / `show` / `diff` / `file-content`，不改动任何东西。
+  `/file-content` 只用于 Markdown 预览：要求真实工作树、路径必须落在根内（拒绝 `..` 穿越）、
+  二进制（含 NUL）拒读、上限 1 MiB。
 - **写操作只有两处**，都按根校验（必须是真实工作树、不能是另一个仓库的子目录）：
   - 「提交」：对你指定的那些文件执行 `git add -- <files>` + `git commit -- <files>`。
     它显式列出路径，**不用 `git add -A`**，也不会把别人已经暂存的内容一并带走。
@@ -120,8 +130,8 @@ dsh plugin --profile desktop add /path/to/dsh-multi-root-changes
     不会弹出面板无法应答的登录窗。游离 HEAD 直接拒绝（没有分支可推）。
 - **AI 生成只读**：起草提交信息时只把当前目录的 diff 与文件名喂给模型，不写仓库、不碰凭据
   （由宿主 `ctx.llm` 解析 provider），并且只取 `text-delta`，模型「思考过程」不会混进提交信息。
-- 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state`、`/diff`、`/log`、`/commit`、
-  `/commit-write`、`/suggest-message`、`/push`。
+- 宿主路由挂在页面同源下：`/dsh-multi-root-changes/api/state`、`/diff`、`/file-content`、
+  `/log`、`/commit`、`/commit-write`、`/suggest-message`、`/push`。
 - 提交 hash 在进入命令行前只放行十六进制对象 id，因此不会被当作 flag 或 rev 表达式。
 
 ## 已知边界
@@ -143,7 +153,9 @@ node --check index.js
 node --check client.js
 node tests/verify-parsers.mjs       # 工作区改动解析器：合成记录 + 真实仓库（可选）
 node tests/verify-commit-log.mjs    # 提交历史解析器：合成记录 + 真实仓库（可选）
-node tests/verify-push.mjs          # 推送按钮 + 成功后刷新提交历史的回归验证
+node tests/verify-push.mjs          # 推送 / 提交 / 主目录默认 / Markdown 预览链路回归
+node tests/verify-file-content.mjs  # /file-content 只读全文路由：路径穿越、非仓库、二进制、上限
+node tests/verify-markdown.mjs      # Markdown 渲染器：块级语法、链接白名单、XSS 注入防护
 ```
 
 前两个脚本的「真实仓库」一段由调用方通过环境变量给出，仓库里不写死任何人的目录布局：

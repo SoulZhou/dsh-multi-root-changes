@@ -98,7 +98,11 @@ window.__ModuleLoader__.load({
         commitBoxCommitPushTitle: '提交并推送：把已勾选的改动写成本地提交（信息留空自动生成），再上传到远端（需要网络）',
         commitPushAction: '提交+推送',
         commitPushBusy: '提交并推送中…',
-        committedAndPushed: '已提交 {hash} 并推送 {branch}'
+        committedAndPushed: '已提交 {hash} 并推送 {branch}',
+        markdownPreview: '预览',
+        markdownSource: '源码',
+        markdownPreviewTitle: '按 Markdown 排版渲染全文（当前文件内容）',
+        markdownSourceTitle: '查看该文件的差异 / 源码（改动补丁）'
       },
       en: {
         tab: 'Multi-root changes',
@@ -154,7 +158,11 @@ window.__ModuleLoader__.load({
         commitBoxCommitPushTitle: 'Commit & push: write the CHECKED changes as a local commit (drafts a message when empty), then upload to the remote (needs network)',
         commitPushAction: 'Commit+Push',
         commitPushBusy: 'Committing and pushing…',
-        committedAndPushed: 'Committed {hash} and pushed {branch}'
+        committedAndPushed: 'Committed {hash} and pushed {branch}',
+        markdownPreview: 'Preview',
+        markdownSource: 'Source',
+        markdownPreviewTitle: 'Render the whole current file as formatted Markdown',
+        markdownSourceTitle: 'Show this file’s diff / raw source (patch)'
       }
     };
 
@@ -355,6 +363,180 @@ window.__ModuleLoader__.load({
         open ? h('div', null, node.children.map((child, index) => render(child, depth + 1, `${node.name}:${index}`))) : null);
     }
 
+    /* ------------------------------------------------------------------ *
+     * A tiny, dependency-free Markdown renderer.
+     *
+     * The client half cannot import a markdown package (no bundler, React is
+     * borrowed from the shell), and rendering untrusted file content through
+     * innerHTML would be an injection hole. So this walks the block structure
+     * by hand and builds EVERY node with createElement — text is always a text
+     * node, never HTML. Links are restricted to http/https/mailto/# targets.
+     * Supported: headings, bold/italic, inline code, links, fenced code,
+     * unordered/ordered lists, blockquotes, horizontal rules and GFM tables.
+     * ------------------------------------------------------------------ */
+
+    /** Only these URL schemes may become a link target. */
+    function safeMarkdownUrl(raw) {
+      const url = String(raw).trim();
+      if (url.startsWith('#')) return url;
+      if (/^(https?:|mailto:)/i.test(url)) return url;
+      return null;
+    }
+
+    /**
+     * Inline markup -> an array of React children. A single regex with named
+     * alternatives keeps the scanner linear and avoids nested-string recursion;
+     * `**bold**`, `*em*`, `` `code` `` and `[text](url)` are all handled here.
+     */
+    function renderInline(text) {
+      const out = [];
+      const pattern = /(\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|_([^_\n]+)_|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\))/g;
+      let last = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) out.push(text.slice(last, match.index));
+        const token = match[0];
+        if (token.startsWith('**') || token.startsWith('__')) {
+          out.push(h('strong', { key: match.index }, match[2] ?? match[3]));
+        } else if (token.startsWith('`')) {
+          out.push(h('code', { key: match.index, className: 'mrc-mdCode' }, match[6]));
+        } else if (token.startsWith('[')) {
+          const url = safeMarkdownUrl(match[8]);
+          // An unsafe scheme degrades to plain text instead of a live link.
+          out.push(url === null
+            ? match[7]
+            : h('a', { key: match.index, href: url, target: '_blank', rel: 'noopener noreferrer' }, match[7]));
+        } else {
+          out.push(h('em', { key: match.index }, match[4] ?? match[5]));
+        }
+        last = match.index + token.length;
+      }
+      if (last < text.length) out.push(text.slice(last));
+      return out;
+    }
+
+    /** Split a table row on unescaped pipes, dropping the outer empty cells. */
+    function splitTableRow(line) {
+      const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|');
+      return cells.map((cell) => cell.trim());
+    }
+
+    /** Is `line` a GFM delimiter row like `| --- | :---: | ---: |`? */
+    function isTableDelimiter(line) {
+      const cells = splitTableRow(line);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    }
+
+    /** Render a whole Markdown document into React elements (no innerHTML). */
+    function MarkdownBody(props) {
+      const { content } = props;
+      const lines = String(content ?? '').replace(/\r\n?/g, '\n').split('\n');
+      const blocks = [];
+      let i = 0;
+      let key = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        // Fenced code block: collect verbatim until the closing fence.
+        const fence = /^```\s*([^`]*)$/.exec(line);
+        if (fence) {
+          const code = [];
+          i += 1;
+          while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i += 1; }
+          if (i < lines.length) i += 1;
+          blocks.push(h('pre', { key: key++, className: 'mrc-mdPre' },
+            h('code', { className: 'mrc-mdCode' }, code.join('\n'))));
+          continue;
+        }
+
+        // Blank line: just skip it (paragraph separation is implicit).
+        if (line.trim() === '') { i += 1; continue; }
+
+        // Horizontal rule.
+        if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+          blocks.push(h('hr', { key: key++, className: 'mrc-mdHr' }));
+          i += 1;
+          continue;
+        }
+
+        // ATX heading (# .. ######).
+        const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+        if (heading) {
+          const level = heading[1].length;
+          blocks.push(h(`h${level}`, { key: key++, className: `mrc-mdH mrc-mdH${level}` }, renderInline(heading[2].replace(/\s+#+\s*$/, ''))));
+          i += 1;
+          continue;
+        }
+
+        // Blockquote: consume consecutive `>` lines into one quote block.
+        if (/^\s*>/.test(line)) {
+          const quoted = [];
+          while (i < lines.length && /^\s*>/.test(lines[i])) {
+            quoted.push(lines[i].replace(/^\s*>\s?/, ''));
+            i += 1;
+          }
+          blocks.push(h('blockquote', { key: key++, className: 'mrc-mdQuote' }, renderInline(quoted.join(' '))));
+          continue;
+        }
+
+        // GFM table: a header row immediately followed by a delimiter row.
+        if (line.includes('|') && i + 1 < lines.length && isTableDelimiter(lines[i + 1])) {
+          const header = splitTableRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(splitTableRow(lines[i]));
+            i += 1;
+          }
+          const headRow = h('tr', null, header.map((cell, c) =>
+            h('th', { key: c }, renderInline(cell))));
+          const bodyRows = rows.map((row, r) => h('tr', { key: r },
+            header.map((_, c) => h('td', { key: c }, row[c] !== undefined ? renderInline(row[c]) : null))));
+          const table = h('table', { className: 'mrc-mdTable' },
+            h('thead', null, headRow),
+            h('tbody', null, bodyRows));
+          blocks.push(h('div', { key: key++, className: 'mrc-mdTableWrap' }, table));
+          continue;
+        }
+
+        // Unordered / ordered list: keep consecutive items of the same kind.
+        const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+        const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+        if (ul || ol) {
+          const ordered = ul === null;
+          const items = [];
+          while (i < lines.length) {
+            const m = ordered
+              ? /^\s*\d+[.)]\s+(.*)$/.exec(lines[i])
+              : /^\s*[-*+]\s+(.*)$/.exec(lines[i]);
+            if (!m) break;
+            items.push(h('li', { key: items.length }, renderInline(m[1])));
+            i += 1;
+          }
+          blocks.push(h(ordered ? 'ol' : 'ul', { key: key++, className: 'mrc-mdList' }, items));
+          continue;
+        }
+
+        // Paragraph: join consecutive non-blank, non-block lines with a space.
+        const para = [line];
+        i += 1;
+        while (i < lines.length && lines[i].trim() !== ''
+          && !/^```|^\s*>|^#{1,6}\s|^\s*(-{3,}|\*{3,}|_{3,})\s*$|^\s*[-*+]\s|^\s*\d+[.)]\s/.test(lines[i])) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        blocks.push(h('p', { key: key++, className: 'mrc-mdP' }, renderInline(para.join(' '))));
+      }
+
+      return h('div', { className: 'mrc-markdown' }, blocks);
+    }
+
+    /** True for file names the panel should offer a Markdown preview for. */
+    function isMarkdownPath(path) {
+      return /\.(md|markdown|mdown|mkd)$/i.test(String(path ?? ''));
+    }
+
     /**
      * Render a unified patch by KEEPING git's own hunk structure: header lines
      * start a new section, `+`/`-` lines are the content, everything else is
@@ -415,41 +597,90 @@ window.__ModuleLoader__.load({
         rows);
     }
 
-    /** The diff reader: a unified patch, or a new file's whole content. */
+    /**
+     * The file reader: a unified patch, a new file's whole content, or — for
+     * Markdown files — a rendered PREVIEW of the full current document.
+     *
+     * A diff only contains changed hunks, so rendering a Markdown file from it
+     * would drop every unchanged heading/list and produce a broken document.
+     * The preview therefore reads the whole file through /file-content, while
+     * "源码" keeps the original diff/source view one click away. The toggle only
+     * appears for .md-ish paths; every other file behaves exactly as before.
+     */
     function DiffView(props) {
       const { root, entry, t, refreshTick } = props;
+      const isMd = isMarkdownPath(entry.path);
+      // Markdown opens in preview; switching files resets to that default.
+      const [view, setView] = useState('preview');
       const [state, setState] = useState({ loading: true, error: null, data: null });
+
+      useEffect(() => { setView('preview'); }, [root, entry.path]);
 
       useEffect(() => {
         let live = true;
         setState({ loading: true, error: null, data: null });
-        postJson('/diff', {
-          root,
-          path: entry.path,
-          origPath: entry.origPath,
-          staged: entry.untracked === true ? false : (entry.y === ' ' && entry.x !== ' '),
-          untracked: entry.untracked === true
-        }).then((data) => {
+        const request = isMd && view === 'preview'
+          ? postJson('/file-content', { root, path: entry.path })
+          : postJson('/diff', {
+            root,
+            path: entry.path,
+            origPath: entry.origPath,
+            staged: entry.untracked === true ? false : (entry.y === ' ' && entry.x !== ' '),
+            untracked: entry.untracked === true
+          });
+        request.then((data) => {
           if (live) setState({ loading: false, error: null, data });
         }).catch((error) => {
           if (live) setState({ loading: false, error: error.message, data: null });
         });
         return () => { live = false; };
-      }, [root, entry.path, entry.origPath, entry.x, entry.y, entry.untracked, refreshTick]);
+      }, [root, entry.path, entry.origPath, entry.x, entry.y, entry.untracked, refreshTick, isMd, view]);
 
-      if (state.loading) return h('div', { className: 'mrc-diffNote' }, t('loading'));
-      if (state.error !== null) return h('div', { className: 'mrc-diffNote mrc-error' }, `${t('diffFailed')}: ${state.error}`);
+      // The toggle lives INSIDE the diff pane so it is always reachable, even
+      // when the preview itself fails to load.
+      const toggle = isMd
+        ? h('div', { className: 'mrc-mdToggle' },
+          h('button', {
+            type: 'button',
+            className: view === 'preview' ? 'mrc-mdToggleBtn mrc-mdToggleActive' : 'mrc-mdToggleBtn',
+            onClick: () => setView('preview'),
+            title: t('markdownPreviewTitle')
+          }, t('markdownPreview')),
+          h('button', {
+            type: 'button',
+            className: view === 'source' ? 'mrc-mdToggleBtn mrc-mdToggleActive' : 'mrc-mdToggleBtn',
+            onClick: () => setView('source'),
+            title: t('markdownSourceTitle')
+          }, t('markdownSource')))
+        : null;
+
+      const wrap = (body) => h('div', { className: 'mrc-diffView' }, toggle, body);
+
+      if (state.loading) return wrap(h('div', { className: 'mrc-diffNote' }, t('loading')));
+      if (state.error !== null) return wrap(h('div', { className: 'mrc-diffNote mrc-error' }, `${t('diffFailed')}: ${state.error}`));
       const data = state.data;
-      if (data === null) return h('div', { className: 'mrc-diffNote' }, t('diffEmpty'));
+      if (data === null) return wrap(h('div', { className: 'mrc-diffNote' }, t('diffEmpty')));
+
+      // Markdown preview branch: full text from /file-content.
+      if (isMd && view === 'preview') {
+        if (data.kind === 'binary') {
+          const kb = Math.max(1, Math.round((data.size ?? 0) / 1024));
+          return wrap(h('div', { className: 'mrc-diffNote' }, `${t('binary')} · ${kb} KB`));
+        }
+        const content = String(data.content ?? '');
+        return wrap(h('div', { className: 'mrc-mdScroll' },
+          data.truncated ? h('div', { className: 'mrc-diffNote' }, t('tooLarge')) : null,
+          h(MarkdownBody, { content })));
+      }
 
       if (data.kind === 'binary') {
         const kb = Math.max(1, Math.round((data.size ?? 0) / 1024));
-        return h('div', { className: 'mrc-diffNote' }, `${t('binary')} · ${kb} KB`);
+        return wrap(h('div', { className: 'mrc-diffNote' }, `${t('binary')} · ${kb} KB`));
       }
 
       if (data.kind === 'untracked') {
         const lines = String(data.content ?? '').split('\n');
-        return h('div', { className: 'mrc-diff' },
+        return wrap(h('div', { className: 'mrc-diff' },
           data.truncated ? h('div', { className: 'mrc-diffNote' }, t('tooLarge')) : null,
           h('div', { className: 'mrc-diffHead' }, `${t('untracked')} · ${entry.path}`),
           lines.map((line, index) => h('div', { key: index, className: 'mrc-line mrc-lineAdd' },
@@ -457,13 +688,13 @@ window.__ModuleLoader__.load({
             // A whole new file is all additions, so every row carries the same
             // `+` the diff rows do — the gutter lines up across both views.
             h('span', { className: 'mrc-sign' }, '+'),
-            h('span', { className: 'mrc-lineText' }, line))));
+            h('span', { className: 'mrc-lineText' }, line)))));
       }
 
       const patch = String(data.patch ?? '');
-      if (patch.trim() === '') return h('div', { className: 'mrc-diffNote' }, t('diffEmpty'));
+      if (patch.trim() === '') return wrap(h('div', { className: 'mrc-diffNote' }, t('diffEmpty')));
 
-      return h(DiffBody, { patch });
+      return wrap(h(DiffBody, { patch }));
     }
 
     /** A commit's own diff, read from the root that owns it. */
@@ -1038,7 +1269,12 @@ window.__ModuleLoader__.load({
       const onScreen = visible !== false;
       // The quick bar's repository picker: '' means every root (the original
       // accordion view); a concrete path collapses the list to that one root.
+      // The FIRST time /state delivers roots, default the picker to the PRIMARY
+      // root so the panel opens on the session's main project instead of a
+      // merged view of every additional root. A ref gates this to once only:
+      // later polls (and the user's own choices) must never be overridden.
       const [pickedRoot, setPickedRoot] = useState('');
+      const autoPicked = useRef(false);
 
       useEffect(() => {
         if (!onScreen || sessionId === undefined) return undefined;
@@ -1072,6 +1308,19 @@ window.__ModuleLoader__.load({
       }, []);
 
       const roots = state.data?.roots ?? [];
+
+      // Default the picker to the PRIMARY root, once, as soon as /state has
+      // delivered a root list. Before that first response there is nothing to
+      // pick; after it, the user's selection (including "所有项目") is final.
+      useEffect(() => {
+        if (autoPicked.current || roots.length === 0) return;
+        const primary = roots.find((root) => root.kind === 'primary');
+        if (primary !== undefined) {
+          autoPicked.current = true;
+          setPickedRoot(primary.path);
+        }
+      }, [roots]);
+
       // Partial-commit checkboxes: one SET of paths the user UNCHECKED, keyed
       // by `${repoPath}\n${file}` and remembered per repository. Unlisted
       // paths default to CHECKED, so nothing changes until the user opts a
@@ -1395,6 +1644,49 @@ window.__ModuleLoader__.load({
 .mrc-diffTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
   font-family: var(--ds-font-family-code); font-size: 11px; }
 .mrc-diff { overflow: auto; flex: 1; min-height: 0; font-family: var(--ds-font-family-code); font-size: 11px; }
+/* DiffView wrapper: the preview/source toggle sits above a scrollable body, and
+   both live inside the same flex column as the diff pane itself. */
+.mrc-diffView { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.mrc-mdToggle { display: flex; gap: 4px; padding: 4px 8px; flex: none;
+  border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.mrc-mdToggleBtn { border: 1px solid var(--dsw-alias-border-l2); border-radius: 4px;
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  font: inherit; font-size: 10px; padding: 1px 10px; }
+.mrc-mdToggleBtn:hover { background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary); }
+.mrc-mdToggleActive { border-color: var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-state-business-primary); font-weight: 600; }
+.mrc-mdScroll { overflow: auto; flex: 1; min-height: 0; padding: 10px 14px; }
+/* Markdown preview: read the theme's LABEL aliases, never surface aliases, so
+   glass/wallpaper themes cannot turn the text transparent. No remote images are
+   loaded (the renderer emits links, never <img>), so nothing leaks by opening
+   a file. */
+.mrc-markdown { color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 1.65;
+  word-wrap: break-word; }
+.mrc-markdown .mrc-mdH { margin: 14px 0 6px; line-height: 1.3; font-weight: 700; }
+.mrc-markdown .mrc-mdH1 { font-size: 19px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding-bottom: 4px; }
+.mrc-markdown .mrc-mdH2 { font-size: 16px; border-bottom: 1px solid var(--dsw-alias-border-l1); padding-bottom: 3px; }
+.mrc-markdown .mrc-mdH3 { font-size: 14px; }
+.mrc-markdown .mrc-mdH4, .mrc-markdown .mrc-mdH5, .mrc-markdown .mrc-mdH6 { font-size: 12px; }
+.mrc-markdown .mrc-mdP { margin: 6px 0; }
+.mrc-markdown .mrc-mdList { margin: 6px 0; padding-left: 22px; }
+.mrc-markdown .mrc-mdList li { margin: 2px 0; }
+.mrc-markdown .mrc-mdQuote { margin: 8px 0; padding: 2px 10px;
+  border-left: 3px solid var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-label-secondary); }
+.mrc-markdown .mrc-mdHr { border: 0; border-top: 1px solid var(--dsw-alias-border-l1); margin: 12px 0; }
+.mrc-markdown a { color: var(--dsw-alias-state-business-primary); }
+.mrc-markdown .mrc-mdCode { font-family: var(--ds-font-family-code); font-size: 11px;
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18)); border-radius: 3px; padding: 1px 4px; }
+.mrc-markdown .mrc-mdPre { overflow: auto; margin: 8px 0; padding: 8px 10px;
+  background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18));
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 4px; }
+.mrc-markdown .mrc-mdPre .mrc-mdCode { background: transparent; padding: 0; }
+.mrc-markdown .mrc-mdTableWrap { overflow-x: auto; }
+.mrc-markdown .mrc-mdTable { border-collapse: collapse; margin: 8px 0; font-size: 11px; }
+.mrc-markdown .mrc-mdTable th, .mrc-markdown .mrc-mdTable td {
+  border: 1px solid var(--dsw-alias-border-l2); padding: 3px 8px; text-align: left; }
+.mrc-markdown .mrc-mdTable th { background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,.18)); font-weight: 600; }
 .mrc-line { display: flex; gap: 8px; padding: 0 8px; white-space: pre; }
 .mrc-lineNo { color: var(--dsw-alias-label-tertiary); min-width: 34px; text-align: right; flex: none;
   user-select: none; }

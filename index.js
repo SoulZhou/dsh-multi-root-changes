@@ -1201,6 +1201,57 @@ async function handleDiff(request, response) {
   }
 }
 
+/**
+ * Read one file's WHOLE text content from a root (read-only).
+ *
+ * A unified diff only shows changed hunks, which is not enough to render a
+ * Markdown document as a document: the preview needs the full current file,
+ * including the unchanged parts. The client asks for this only for `.md` /
+ * `.markdown` files that it is about to render.
+ *
+ * Safety, in order: the root must be a real work tree; the requested path must
+ * resolve INSIDE that root (no `..` escape, no absolute override); the file
+ * must be text (no NUL bytes) and within a 1 MiB ceiling. Nothing is written.
+ */
+async function handleFileContent(request, response) {
+  const body = await readJsonBody(request);
+  const root = typeof body.root === 'string' && body.root !== '' ? resolve(body.root) : '';
+  const rel = typeof body.path === 'string' ? body.path : '';
+  if (root === '' || rel === '') {
+    sendText(response, 400, 'root and path are required');
+    return;
+  }
+  const abs = resolve(root, rel);
+  // Containment check: `abs` must be `root` itself or sit below `root + sep`.
+  // Case-insensitive on Windows (resolve already normalized separators).
+  const inside = abs === root || abs.startsWith(root + (abs.includes('\\') ? '\\' : '/'));
+  if (!inside) {
+    sendText(response, 400, 'path escapes the repository root');
+    return;
+  }
+  try {
+    const repo = await inspectRepo(root);
+    if (repo.isRepo !== true) {
+      sendText(response, 400, 'not a git work tree');
+      return;
+    }
+    const content = await readFile(abs);
+    if (looksBinary(content)) {
+      sendJson(response, 200, { kind: 'binary', size: content.length });
+      return;
+    }
+    const clipped = content.length > MAX_UNTRACKED_BYTES ? content.subarray(0, MAX_UNTRACKED_BYTES) : content;
+    sendJson(response, 200, {
+      kind: 'text',
+      content: clipped.toString('utf8'),
+      size: content.length,
+      truncated: content.length > MAX_UNTRACKED_BYTES
+    });
+  } catch (error) {
+    sendText(response, error.status ?? 500, error.message || 'file read failed');
+  }
+}
+
 /** Draft a commit message for one root and hand it back. */
 async function handleSuggestMessage(ctx, request, response) {
   const body = await readJsonBody(request);
@@ -1232,6 +1283,13 @@ export function apply(ctx) {
           handler: (request, response) => {
             if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
             return handleDiff(request, response);
+          }
+        },
+        {
+          path: `${API}/file-content`,
+          handler: (request, response) => {
+            if (request.method !== 'POST') { sendText(response, 405, 'method not allowed'); return; }
+            return handleFileContent(request, response);
           }
         },
         {
@@ -1290,4 +1348,4 @@ export function apply(ctx) {
   });
 }
 
-export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog, handlePush };
+export const __test = { parsePorcelainV2, parseNumstat, splitFixed, pathIdentity, parseLog, handlePush, handleFileContent, looksBinary };

@@ -142,6 +142,31 @@ console.log('\n=== 1. client: push button + active commit-history refresh ===');
     clientSrc.includes("pushAction: '推送'") && clientSrc.includes("pushing: '推送中…'") && clientSrc.includes("pushed: '已推送 {branch}'"));
   check('en copy has push keys',
     clientSrc.includes("pushAction: 'Push'") && clientSrc.includes("pushing: 'Pushing…'") && clientSrc.includes("pushed: 'Pushed {branch}'"));
+
+  // 0.3.13: picker defaults to the PRIMARY root, once /state has delivered it.
+  check('picker auto-selects the primary root (kind === primary)',
+    /roots\.find\(\(root\) => root\.kind === 'primary'\)/.test(clientSrc));
+  check('auto-pick is gated by a ref (runs once, never overrides the user)',
+    /autoPicked\.current/.test(clientSrc) && /useRef\(false\)/.test(clientSrc));
+
+  // 0.3.13: Markdown files render a full-file PREVIEW with a source toggle.
+  check('markdown path detector covers .md/.markdown variants',
+    /function isMarkdownPath/.test(clientSrc) && /\\\.\(md\|markdown\|mdown\|mkd\)/i.test(clientSrc));
+  check('preview is the default view and resets per file',
+    /useState\('preview'\)/.test(clientSrc) && /setView\('preview'\)/.test(clientSrc));
+  check('preview reads full content from /file-content',
+    /postJson\('\/file-content', \{ root, path: entry\.path \}\)/.test(clientSrc));
+  check('preview/source toggle is rendered only for markdown',
+    /isMd\s*\?\s*h\('div', \{ className: 'mrc-mdToggle'/.test(clientSrc) ||
+    /isMd[\s\S]{0,80}mrc-mdToggle/.test(clientSrc));
+  check('markdown renderer builds nodes with createElement (no innerHTML)',
+    /function MarkdownBody/.test(clientSrc) &&
+    !/dangerouslySetInnerHTML/.test(clientSrc) &&
+    !/\.innerHTML\s*=/.test(clientSrc));
+  check('markdown links are restricted to http/https/mailto/#',
+    /function safeMarkdownUrl/.test(clientSrc) && /\^\(https\?:|mailto:\)/i.test(clientSrc));
+  check('host registers the /file-content route',
+    indexSrc.includes('`${API}/file-content`'));
 }
 
 console.log('\n=== 2. host: a deliberately safe /push route ===');
